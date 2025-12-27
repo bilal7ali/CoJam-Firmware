@@ -1,140 +1,121 @@
-/**
- * CoJam-Firmware
- * BPM Detection System for Daisy Seed
- * 
- * Initial version: Audio passthrough with structure for BPM detection
- */
-
 #include "daisy_seed.h"
-#include "arm_math.h"
 
+// Use the daisy namespace to prevent having to type
+// daisy:: before all libdaisy functions
 using namespace daisy;
 
-// Hardware object
+// Declare a DaisySeed object called hardware
 DaisySeed hw;
+CpuLoadMeter load;
 
-// CPU load monitoring
-CpuLoadMeter loadMeter;
+// CONSTANTS
+static constexpr size_t BUFFER_SIZE = 2048U;
+static constexpr float SAMPLE_RATE = 48000.0f;
+static constexpr size_t OUTPUT_RATE = 480U;
+static constexpr size_t BLOCK_SIZE = 48U;
 
-// =============================================================================
-// GLOBAL BUFFERS AND FLAGS
-// =============================================================================
+// GLOBAL VARIABLES
+static float mono_buffer[BUFFER_SIZE];
+static volatile size_t buf_pos = 0U;
+static volatile size_t sample_count = 0U;
+static volatile size_t samples_available = 0U;
+static volatile float peak = 0.0f;
+static volatile bool debug_sample_ready = false;
+static volatile float debug_sample = 0.0f;
 
-// Buffer for onset detection data (to be analyzed in main loop)
-#define ONSET_BUFFER_SIZE 2048
-float onset_buffer[ONSET_BUFFER_SIZE];
-int onset_write_idx = 0;
-bool analysis_ready = false;
-
-// Current BPM estimate
-float current_bpm = 0.0f;
-
-// =============================================================================
-// AUDIO CALLBACK - MUST BE FAST (<1ms)
-// =============================================================================
-
-void AudioCallback(AudioHandle::InputBuffer in, 
-                   AudioHandle::OutputBuffer out, 
-                   size_t size)
+static void Callback(AudioHandle::InputBuffer   in,
+                     AudioHandle::OutputBuffer  out,
+                     size_t                     size)
 {
-    loadMeter.OnBlockStart();
-    
-    for(size_t i = 0; i < size; i++)
+    load.OnBlockStart();
+    float mono = 0.0f;
+    float abs_mono = 0.0f;
+
+    for (size_t i = 0; i < size; i++)
     {
-        // TODO: Add lightweight onset detection here
-        // For now, just store the input samples
-        onset_buffer[onset_write_idx++] = in[0][i];
-        
-        // When buffer is full, signal main loop to analyze
-        if(onset_write_idx >= ONSET_BUFFER_SIZE)
+        out[0][i] = in[0][i]; // pass through audio
+        out[1][i] = in[1][i];
+
+        mono = (in[0][i] + in[1][i]) * 0.5f; // mix to mono
+
+        mono_buffer[buf_pos] = mono; // add to circular buffer
+        buf_pos = (buf_pos + 1U) % BUFFER_SIZE;
+
+        if (samples_available < BUFFER_SIZE)
         {
-            analysis_ready = true;
-            onset_write_idx = 0;
+            samples_available++;
         }
-        
-        // Audio passthrough (zero latency)
-        out[0][i] = in[0][i];  // Left channel
-        out[1][i] = in[1][i];  // Right channel
+
+        if (mono <= 0.0f)
+        {
+            mono = -mono;
+        }
+
+        if (abs_mono > peak)
+        {
+            peak = abs_mono;
+        }
+
+        sample_count++;
+
+        if (sample_count >= OUTPUT_RATE)
+        {
+            sample_count = 0U;
+            debug_sample = mono;
+            debug_sample_ready = true;
+        }
+
     }
-    
-    loadMeter.OnBlockEnd();
+
+    load.OnBlockEnd();
 }
-
-// =============================================================================
-// BPM ANALYSIS (runs in main loop - can take time)
-// =============================================================================
-
-void AnalyzeBPM()
-{
-    // TODO: Implement autocorrelation-based BPM detection here
-    // This runs in the main loop, so it can take more time
-    
-    // Placeholder: just clear the flag for now
-    analysis_ready = false;
-    
-    // Example: Set a dummy BPM value
-    current_bpm = 120.0f;
-}
-
-// =============================================================================
-// MAIN
-// =============================================================================
 
 int main(void)
 {
-    // Initialize hardware
+    // Declare a variable to store the state we want to set for the LED.
+    bool led_state;
+    led_state = true;
+
+    // Configure and Initialize the Daisy Seed
     hw.Init();
-    
-    // Start serial logging for debug output
-    hw.StartLog();
-    
-    // Initialize CPU load meter
-    loadMeter.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
-    
-    // Configure audio settings
-    // Sample rate: 48kHz (can go up to 96kHz for better detection)
-    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
-    
-    // Block size: 48 samples = 1ms of audio at 48kHz
-    hw.SetAudioBlockSize(48);
-    
-    // Start audio processing
-    hw.StartAudio(AudioCallback);
-    
-    // Print startup message
-    hw.PrintLine("CoJam-Firmware Starting...");
-    hw.PrintLine("Sample Rate: %.0f Hz", hw.AudioSampleRate());
-    hw.PrintLine("Block Size: %d samples", hw.AudioBlockSize());
-    hw.PrintLine("");
-    
-    uint32_t last_print_time = System::GetNow();
-    
-    // Main loop
-    while(1)
+    hw.SetAudioBlockSize(BLOCK_SIZE);
+    hw.StartLog(true);
+    load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
+
+    hw.StartAudio(Callback);
+
+    // uint32_t status_counter = 0U;
+
+    while(true)
     {
-        // Run BPM analysis when buffer is ready
-        if(analysis_ready)
+        if (debug_sample_ready)
         {
-            AnalyzeBPM();
+            hw.PrintLine("SAMPLE,%.6f", debug_sample);
+            debug_sample_ready = false;
+            led_state = !led_state;
+            hw.SetLed(led_state);
         }
-        
-        // Print status every second
-        if(System::GetNow() - last_print_time > 1000)
-        {
-            // Get CPU load
-            float avg_load = loadMeter.GetAvgCpuLoad();
-            float max_load = loadMeter.GetMaxCpuLoad();
-            
-            // Print status
-            hw.PrintLine("BPM: %.1f | CPU: %.1f%% (max: %.1f%%)", 
-                        current_bpm, 
-                        avg_load * 100.0f,
-                        max_load * 100.0f);
-            
-            last_print_time = System::GetNow();
-        }
-        
-        // Small delay to prevent busy-waiting
-        System::Delay(1);
+
+        // status_counter++;
+        // if (status_counter >= 1000U)
+        // {
+        //     status_counter = 0U;
+
+        //     /* Output level and buffer status */
+        //     hw.PrintLine("LEVEL,%.4f,%d",
+        //                  (double)peak,
+        //                  (int)samples_available);
+
+        //     /* Reset peak level for next period */
+        //     peak = 0.0F;
+
+            // led_state = !led_state;
+            // hw.SetLed(led_state);
+        // }
+
+        // /* Small delay to prevent tight spinning */
+        // hw.DelayMs(1);
+
+        System::Delay(100);
     }
 }
