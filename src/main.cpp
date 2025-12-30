@@ -4,15 +4,23 @@
 // daisy:: before all libdaisy functions
 using namespace daisy;
 
+extern "C" {
+#include "arm_math.h"
+}
+
 // Declare a DaisySeed object called hardware
 DaisySeed hw;
 CpuLoadMeter load;
 
+// DEFINES
+#define FFT_SIZE 1024U
+
 // CONSTANTS
 static constexpr size_t BUFFER_SIZE = 2048U;
 static constexpr float SAMPLE_RATE = 48000.0f;
-static constexpr size_t OUTPUT_RATE = 480U;
+static constexpr size_t OUTPUT_DECIMATION = 480U;
 static constexpr size_t BLOCK_SIZE = 48U;
+static float hann_window[FFT_SIZE];
 
 // GLOBAL VARIABLES
 static float mono_buffer[BUFFER_SIZE];
@@ -22,6 +30,26 @@ static volatile size_t samples_available = 0U;
 static volatile float peak = 0.0f;
 static volatile bool debug_sample_ready = false;
 static volatile float debug_sample = 0.0f;
+static arm_rfft_fast_instance_f32 fft_instance;
+static float fft_output[FFT_SIZE];
+static float fft_output_mag[FFT_SIZE / 2];
+static float windowed_samples[FFT_SIZE];
+
+static void processFrame(void)
+{
+    arm_mult_f32( , hann_window, windowed_samples, FFT_SIZE);
+
+    arm_rfft_fast_f32(&fft_instance, windowed_samples, fft_output, 0);
+    arm_cmplx_mag_f32(fft_output, fft_output_mag, FFT_SIZE/2);
+}
+
+void errorLED(void)
+{
+        hw.SetLed(true);
+        hw.DelayMs(100);
+        hw.SetLed(false);
+        hw.DelayMs(100);
+}
 
 static void Callback(AudioHandle::InputBuffer   in,
                      AudioHandle::OutputBuffer  out,
@@ -46,24 +74,21 @@ static void Callback(AudioHandle::InputBuffer   in,
             samples_available++;
         }
 
-        if (mono <= 0.0f)
-        {
-            mono = -mono;
-        }
+        // abs_mono = abs(mono);
 
-        if (abs_mono > peak)
-        {
-            peak = abs_mono;
-        }
+        // if (abs_mono > peak)
+        // {
+        //     peak = abs_mono;
+        // }
 
-        sample_count++;
+        // sample_count++;
 
-        if (sample_count >= OUTPUT_RATE)
-        {
-            sample_count = 0U;
-            debug_sample = mono;
-            debug_sample_ready = true;
-        }
+        // if (sample_count >= OUTPUT_DECIMATION) // outputs a print every 480 samples
+        // {
+        //     sample_count = 0U;
+        //     debug_sample = mono;
+        //     debug_sample_ready = true;
+        // }
 
     }
 
@@ -82,9 +107,20 @@ int main(void)
     hw.StartLog(true);
     load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 
+    arm_hanning_f32(hann_window, FFT_SIZE); // generate Hann window
+
+    if ((arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE)) != ARM_MATH_SUCCESS) // initialize FFT
+    {
+        hw.Print("FFIT INIT ERROR");
+        while (1)
+        {
+            errorLED();
+        }
+    }
+
     hw.StartAudio(Callback);
 
-    // uint32_t status_counter = 0U;
+    uint32_t output_counter = 0U;
 
     while(true)
     {
@@ -96,26 +132,15 @@ int main(void)
             hw.SetLed(led_state);
         }
 
-        // status_counter++;
-        // if (status_counter >= 1000U)
-        // {
-        //     status_counter = 0U;
+        while (samples_available >= FFT_SIZE)
+        {
+            processFrame();
 
-        //     /* Output level and buffer status */
-        //     hw.PrintLine("LEVEL,%.4f,%d",
-        //                  (double)peak,
-        //                  (int)samples_available);
 
-        //     /* Reset peak level for next period */
-        //     peak = 0.0F;
+        }
 
-            // led_state = !led_state;
-            // hw.SetLed(led_state);
-        // }
 
-        // /* Small delay to prevent tight spinning */
-        // hw.DelayMs(1);
 
-        System::Delay(100);
+        hw.DelayMs(1);
     }
 }
