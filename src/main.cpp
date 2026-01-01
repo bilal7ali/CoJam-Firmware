@@ -66,11 +66,15 @@ static void processFrame(void)
 
 static void outputSpectrum(void)
 {
-    // Output the FFT magnitude spectrum
-    for (size_t i = 0; i < FFT_SIZE / 2; i++)
+    hw.Print("SPEC");
+    
+    // Output every 8th bin (64 values instead of 512)
+    for (size_t i = 0; i < FFT_SIZE / 2; i += 2)
     {
-        hw.PrintLine("FREQ,%.6f,%.6f", (float)i * SAMPLE_RATE / FFT_SIZE, fft_output_mag[i]);
+        int32_t mag = (int32_t)(fft_output_mag[i] * 10000.0f);
+        hw.Print(",%ld", mag);
     }
+    hw.PrintLine("");
 }
 
 // static void outputPeak(void)
@@ -153,7 +157,7 @@ int main(void)
         {
             processFrame();
 
-            if (frame_counter % 4 == 0)
+            if (frame_counter % 8 == 0)
             {
                 outputSpectrum();
                 // outputPeak();

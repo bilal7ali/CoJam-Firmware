@@ -3,14 +3,12 @@
 Spectrogram Visualizer for Daisy Seed FFT Output
 
 Reads serial output in format:
-    FREQ,<frequency_hz>,<magnitude>
-    FREQ,<frequency_hz>,<magnitude>
-    ...
+    SPEC,<mag0>,<mag1>,<mag2>,...   (decimated magnitude bins)
 
 Creates a real-time scrolling spectrogram.
 
 Usage:
-    python3 spectrogram.py /dev/tty.usbmodemXXXX
+    python3 spectrogram_spec.py /dev/tty.usbmodemXXXX
 
 Requirements:
     pip install pyserial matplotlib numpy
@@ -19,7 +17,6 @@ Requirements:
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import deque
 
 try:
     import serial
@@ -28,19 +25,21 @@ except ImportError:
     print("Error: pyserial not installed. Run: pip install pyserial")
     sys.exit(1)
 
-# Configuration
+# Configuration - must match firmware
 SAMPLE_RATE = 48000
 FFT_SIZE = 1024
-NUM_BINS = FFT_SIZE // 2
-HISTORY_FRAMES = 200  # Number of frames to show in spectrogram
-MAX_FREQ_DISPLAY = 20000  # Max frequency to display (Hz)
+NUM_BINS = FFT_SIZE // 2  # 512
+BIN_DECIMATION = 2        # Firmware outputs every 2nd bin
+NUM_OUTPUT_BINS = NUM_BINS // BIN_DECIMATION  # 256
+HISTORY_FRAMES = 200
+MAX_FREQ_DISPLAY = 20000
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 spectrogram.py <serial_port>")
+        print("Usage: python3 spectrogram_spec.py <serial_port>")
         print("\nExamples:")
-        print("  python3 spectrogram.py /dev/tty.usbmodem14101")
-        print("  python3 spectrogram.py COM3")
+        print("  python3 spectrogram_spec.py /dev/tty.usbmodem14101")
+        print("  python3 spectrogram_spec.py COM3")
         print("\nAvailable ports:")
         for port in serial.tools.list_ports.comports():
             print(f"  {port.device} - {port.description}")
@@ -60,139 +59,114 @@ def main():
 
     # Setup plot
     plt.ion()
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8))
     
-    # Frequency axis
-    freqs = np.arange(NUM_BINS) * SAMPLE_RATE / FFT_SIZE
-    max_bin = int(MAX_FREQ_DISPLAY * FFT_SIZE / SAMPLE_RATE)
+    # Frequency axis for decimated bins
+    # Each output bin represents: bin_index * BIN_DECIMATION * SAMPLE_RATE / FFT_SIZE
+    freqs = np.arange(NUM_OUTPUT_BINS) * BIN_DECIMATION * SAMPLE_RATE / FFT_SIZE
+    max_bin_display = min(NUM_OUTPUT_BINS, int(MAX_FREQ_DISPLAY * FFT_SIZE / SAMPLE_RATE / BIN_DECIMATION) + 1)
     
     # Current spectrum (bar plot)
-    bars = ax1.bar(freqs[:max_bin], np.zeros(max_bin), width=SAMPLE_RATE/FFT_SIZE*0.8, color='steelblue')
+    bar_width = BIN_DECIMATION * SAMPLE_RATE / FFT_SIZE * 0.8
+    bars = ax1.bar(freqs[:max_bin_display], np.zeros(max_bin_display), width=bar_width, color='steelblue')
     ax1.set_xlabel('Frequency (Hz)')
     ax1.set_ylabel('Magnitude')
-    ax1.set_title('Current Spectrum')
+    ax1.set_title('Current Spectrum (Decimated)')
     ax1.set_xlim(0, MAX_FREQ_DISPLAY)
-    ax1.set_ylim(0, 0.1)
+    ax1.set_ylim(0, 10000)
     
     # Peak annotation
     peak_text = ax1.text(0.98, 0.95, '', transform=ax1.transAxes, 
                          fontsize=11, verticalalignment='top', horizontalalignment='right',
                          bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.9))
     
-    # Current spectrum (line plot for detail)
-    spectrum_line, = ax2.plot(freqs[:max_bin], np.zeros(max_bin), 'b-', linewidth=0.5)
-    ax2.set_xlabel('Frequency (Hz)')
-    ax2.set_ylabel('Magnitude')
-    ax2.set_title('Spectrum (Line Plot)')
-    ax2.set_xlim(0, MAX_FREQ_DISPLAY)
-    ax2.set_ylim(0, 0.1)
-    ax2.grid(True, alpha=0.3)
-    
-    # Spectrogram (rolling history)
-    spectrogram = np.zeros((max_bin, HISTORY_FRAMES))
+    # Spectrogram
+    spectrogram = np.zeros((max_bin_display, HISTORY_FRAMES))
     img = ax2.imshow(spectrogram, aspect='auto', origin='lower',
                      extent=[0, HISTORY_FRAMES, 0, MAX_FREQ_DISPLAY],
-                     cmap='magma', vmin=0, vmax=0.01)
-    ax3.set_xlabel('Frame')
-    ax3.set_ylabel('Frequency (Hz)')
-    ax3.set_title('Spectrogram (Time History)')
-    
-    # Move spectrogram to ax3
-    ax3.clear()
-    img = ax3.imshow(spectrogram, aspect='auto', origin='lower',
-                     extent=[0, HISTORY_FRAMES, 0, MAX_FREQ_DISPLAY],
-                     cmap='magma', vmin=0, vmax=0.01)
-    ax3.set_xlabel('Frame')
-    ax3.set_ylabel('Frequency (Hz)')
-    ax3.set_title('Spectrogram (Time History)')
-    cbar = plt.colorbar(img, ax=ax3, label='Magnitude')
+                     cmap='magma', vmin=0, vmax=10000)
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Frequency (Hz)')
+    ax2.set_title('Spectrogram (Time History)')
+    cbar = plt.colorbar(img, ax=ax2, label='Magnitude')
     
     plt.tight_layout()
 
-    # Data collection for current frame
-    current_frame = {}
     frame_count = 0
-    last_freq = -1
     
     try:
         while True:
-            line_data = ser.readline().decode('utf-8', errors='ignore').strip()
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
             
-            if not line_data:
+            if not line:
                 continue
-                
-            if line_data.startswith("FREQ,"):
-                parts = line_data.split(",")
-                try:
-                    freq = float(parts[1])
-                    mag = float(parts[2])
-                    
-                    # Detect new frame (frequency wrapped around)
-                    if freq < last_freq and len(current_frame) > 10:
-                        # Process completed frame
-                        mags = np.zeros(NUM_BINS)
-                        for f, m in current_frame.items():
-                            bin_idx = int(round(f * FFT_SIZE / SAMPLE_RATE))
-                            if 0 <= bin_idx < NUM_BINS:
-                                mags[bin_idx] = m
-                        
-                        # Update bar plot
-                        for bar, mag_val in zip(bars, mags[:max_bin]):
-                            bar.set_height(mag_val)
-                        
-                        # Update line plot
-                        spectrum_line.set_ydata(mags[:max_bin])
-                        
-                        # Auto-scale Y axis
-                        max_mag = np.max(mags[:max_bin])
-                        if max_mag > 0:
-                            ax1.set_ylim(0, max_mag * 1.2)
-                            ax2.set_ylim(0, max_mag * 1.2)
-                        
-                        # Find and display peak
-                        peak_idx = np.argmax(mags[1:max_bin]) + 1  # Skip DC
-                        peak_freq = peak_idx * SAMPLE_RATE / FFT_SIZE
-                        peak_mag = mags[peak_idx]
-                        peak_text.set_text(f'Peak: {peak_freq:.1f} Hz\nMag: {peak_mag:.6f}')
-                        
-                        # Update spectrogram
-                        spectrogram = np.roll(spectrogram, -1, axis=1)
-                        spectrogram[:, -1] = mags[:max_bin]
-                        img.set_data(spectrogram)
-                        
-                        # Auto-scale spectrogram color
-                        vmax = np.percentile(spectrogram, 99)
-                        if vmax > 0:
-                            img.set_clim(0, vmax)
-                        
-                        frame_count += 1
-                        if frame_count % 10 == 0:
-                            print(f"Frame {frame_count}: Peak at {peak_freq:.1f} Hz, mag={peak_mag:.6f}")
-                        
-                        # Clear for next frame
-                        current_frame = {}
-                        plt.pause(0.001)
-                    
-                    current_frame[freq] = mag
-                    last_freq = freq
-                    
-                except (ValueError, IndexError) as e:
-                    pass
             
-            elif line_data.startswith("PEAK,"):
-                # Handle PEAK format if present
-                parts = line_data.split(",")
+            # Handle SPEC format: SPEC,mag0,mag1,mag2,...
+            if line.startswith("SPEC,"):
+                parts = line.split(",")
                 try:
-                    freq = float(parts[1])
-                    mag = float(parts[2])
-                    print(f"PEAK: {freq:.1f} Hz, mag={mag:.6f}")
+                    # Parse magnitudes (skip "SPEC" prefix)
+                    mags = [int(x) for x in parts[1:] if x.strip()]
+                    
+                    # Ensure we have enough data
+                    if len(mags) < max_bin_display:
+                        mags.extend([0] * (max_bin_display - len(mags)))
+                    mags = mags[:max_bin_display]
+                    
+                    # Update bar plot
+                    for bar, mag in zip(bars, mags):
+                        bar.set_height(mag)
+                    
+                    # Auto-scale Y axis
+                    max_mag = max(mags) if mags else 1
+                    if max_mag > 0:
+                        ax1.set_ylim(0, max_mag * 1.3)
+                    
+                    # Find and display peak
+                    peak_idx = np.argmax(mags[1:]) + 1  # Skip DC
+                    peak_freq = peak_idx * BIN_DECIMATION * SAMPLE_RATE / FFT_SIZE
+                    peak_mag = mags[peak_idx]
+                    peak_text.set_text(f'Peak: {peak_freq:.0f} Hz\nMag: {peak_mag}')
+                    
+                    # Update spectrogram
+                    spectrogram = np.roll(spectrogram, -1, axis=1)
+                    spectrogram[:, -1] = mags
+                    img.set_data(spectrogram)
+                    
+                    # Auto-scale spectrogram color
+                    vmax = np.percentile(spectrogram, 99)
+                    if vmax > 0:
+                        img.set_clim(0, vmax)
+                    
+                    frame_count += 1
+                    if frame_count % 10 == 0:
+                        print(f"Frame {frame_count}: Peak at {peak_freq:.0f} Hz, mag={peak_mag}")
+                    
+                except ValueError as e:
+                    print(f"Parse error: {e}")
+                    pass
+                
+                plt.pause(0.001)
+            
+            # Handle old FREQ format for compatibility
+            elif line.startswith("FREQ,"):
+                print(f"[FREQ] {line[:60]}...")
+            
+            # Handle PEAK format
+            elif line.startswith("PEAK,"):
+                parts = line.split(",")
+                try:
+                    freq = int(parts[1])
+                    mag = int(parts[2])
+                    print(f"PEAK: {freq} Hz, mag={mag}")
                 except:
                     pass
             
-            else:
-                # Print other messages
-                if line_data and not line_data.startswith("="):
-                    print(f"[INFO] {line_data}")
+            # Other info
+            elif line and not line.startswith("="):
+                # Don't spam with corrupted lines
+                if len(line) < 100:
+                    print(f"[INFO] {line}")
             
     except KeyboardInterrupt:
         print("\n\nExiting...")
