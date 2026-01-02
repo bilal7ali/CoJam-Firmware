@@ -1,8 +1,6 @@
 #include "daisy_seed.h"
 #include "arm_math.h"
 
-// Use the daisy namespace to prevent having to type
-// daisy:: before all libdaisy functions
 using namespace daisy;
 
 DaisySeed hw;
@@ -11,29 +9,79 @@ CpuLoadMeter load;
 // CONSTANTS
 static constexpr size_t BUFFER_SIZE = 4096U;
 static constexpr float SAMPLE_RATE = 48000.0f;
-static constexpr size_t OUTPUT_DECIMATION = 480U;
 static constexpr size_t BLOCK_SIZE = 48U;
 static constexpr size_t FFT_SIZE = 1024U;
 static constexpr size_t HOP_SIZE = 512U;
 static float hann_window[FFT_SIZE];
+static constexpr float THRESHOLD_FACTOR = 2.0f; // onset detection threshold
+static constexpr size_t FLUX_HISTORY_SIZE = 64U; // ~0.7 second history
+static constexpr size_t MIN_ONSET_INTERVAL = 8U; // minimum frames between onsets for debouncing
 
 // GLOBAL VARIABLES
 static float mono_buffer[BUFFER_SIZE];
 static volatile size_t buf_write = 0U;
-static volatile size_t sample_count = 0U;
 static volatile size_t samples_available = 0U;
-static volatile float peak = 0.0f;
-static volatile bool debug_sample_ready = false;
-static volatile float debug_sample = 0.0f;
 static arm_rfft_fast_instance_f32 fft_instance;
 static float fft_output[FFT_SIZE];
 static float fft_output_mag[FFT_SIZE / 2];
 static float windowed_samples[FFT_SIZE];
 static float processing_buffer[FFT_SIZE]; // temp linear buffer for FFT processing
 static volatile size_t buf_read = 0U;
+static float prev_mag[FFT_SIZE / 2] = {0};
+static float fluxHistory[FLUX_HISTORY_SIZE] = {0};
+static size_t fluxHistoryIdx = 0U;
+static float fluxMean = 0.0f;
+static float fluxThreshold = 0.0f;
+static float currentFlux = 0.0f;
+static uint32_t framesSinceOnset = 0U;
+static uint32_t onsetCount = 0U;
+static bool onsetDetected = false;
+static uint32_t frameCount = 0U;
+
+static float calcSpectralFlux(void)
+{
+    float flux = 0.0f;
+
+    for (size_t i = 0U; i < FFT_SIZE / 2; i++)
+    {
+        float diff = fft_output_mag[i] - prev_mag[i];
+
+        flux += fmaxf(0.0f, diff);
+    }
+
+    return flux;
+}
+
+static void updateThreshold(void)
+{
+    fluxHistory[fluxHistoryIdx] = currentFlux;
+    fluxHistoryIdx = (fluxHistoryIdx + 1) % FLUX_HISTORY_SIZE;
+
+    float sum = 0.0f;
+    for (size_t i = 0; i < FLUX_HISTORY_SIZE; i++)
+    {
+        sum += fluxHistory[i];
+    }
+    fluxMean = sum / (float)FLUX_HISTORY_SIZE;
+
+    fluxThreshold = fluxMean * THRESHOLD_FACTOR;
+}
+
+static void detectOnset(void)
+{
+    framesSinceOnset++;
+    onsetDetected = false;
+
+    if ((currentFlux > fluxThreshold) && (framesSinceOnset >= MIN_ONSET_INTERVAL))
+    {
+        onsetDetected = true;
+        framesSinceOnset = 0;
+        onsetCount++;
+    }
+}
 
 // Unwrap a circular buffer to format in contiguous linear buffer
-void unwrap_buffer(float* dest, const float* src, size_t start_idx, size_t len, size_t total_size)
+static void unwrap_buffer(float* dest, const float* src, size_t start_idx, size_t len, size_t total_size)
 {
     size_t first_part = total_size - start_idx;
     if (len < first_part)
@@ -57,19 +105,26 @@ static void processFrame(void)
 
     buf_read = (buf_read + HOP_SIZE) % BUFFER_SIZE; // Update read pointer
 
+    currentFlux = calcSpectralFlux();
+    updateThreshold();
+    detectOnset();
+    memcpy(prev_mag, fft_output_mag, (FFT_SIZE / 2) * sizeof(float));
+
     // Briefly disable interrupts as samples_available is a shared variable
     uint32_t primask = __get_PRIMASK(); // Get current interrupt state
     __disable_irq(); // Disable interrupts
     samples_available -= HOP_SIZE; // Update samples available
     __set_PRIMASK(primask); // Restore interrupt state to previous state
+
+    frameCount++;
 }
 
 static void outputSpectrum(void)
 {
     hw.Print("SPEC");
-    
-    // Output every 8th bin (64 values instead of 512)
-    for (size_t i = 0; i < FFT_SIZE / 2; i += 2)
+
+    // Output every 2nd bin (256 values instead of 512)
+    for (size_t i = 0U; i < FFT_SIZE / 2; i += 2)
     {
         int32_t mag = (int32_t)(fft_output_mag[i] * 10000.0f);
         hw.Print(",%ld", mag);
@@ -77,19 +132,23 @@ static void outputSpectrum(void)
     hw.PrintLine("");
 }
 
-// static void outputPeak(void)
-// {
-//     float32_t peak_mag;
-//     uint32_t peak_idx;
-    
-//     // Find max magnitude (skip DC at index 0)
-//     arm_max_f32(&fft_output_mag[1], (FFT_SIZE / 2) - 1, &peak_mag, &peak_idx);
-//     peak_idx += 1U;  // Adjust for skipped DC
-    
-//     float freq = (float)peak_idx * SAMPLE_RATE / FFT_SIZE;
-    
-//     hw.PrintLine("PEAK,%.1f,%.6f", freq, peak_mag);
-// }
+static void outputOnset(void)
+{
+    if (onsetDetected)
+    {
+        int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
+        hw.PrintLine("ONSET,%lu,%ld,%lu", frameCount, flux_int, onsetCount);
+    }
+}
+
+static void outputFlux(void)
+{
+    int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
+    int32_t thresh_int = (int32_t)(fluxThreshold * 1000.0f);
+    int32_t onset_int = onsetDetected ? 1 : 0;
+
+    hw.PrintLine("FLUX,%ld,%ld,%ld", flux_int, thresh_int, onset_int);
+}
 
 void errorLED(void)
 {
@@ -106,7 +165,7 @@ static void Callback(AudioHandle::InputBuffer   in,
     load.OnBlockStart();
     float mono = 0.0f;
 
-    for (size_t i = 0; i < size; i++)
+    for (size_t i = 0U; i < size; i++)
     {
         out[0][i] = in[0][i]; // pass through audio
         out[1][i] = in[1][i];
@@ -148,7 +207,7 @@ int main(void)
 
     hw.StartAudio(Callback);
 
-    uint32_t frame_counter = 0U;
+    uint32_t outputCounter = 0U;
 
     while(true)
     {
@@ -157,20 +216,23 @@ int main(void)
         {
             processFrame();
 
-            if (frame_counter % 8 == 0)
+            outputCounter++;
+
+            if (outputCounter % 4 == 0)
             {
-                outputSpectrum();
-                // outputPeak();
+                // outputSpectrum();
+                outputFlux();
             }
 
-            frame_counter++;
-            if (frame_counter >= 1000U)
+            outputOnset();
+
+            if (outputCounter >= 1000U)
             {
-                frame_counter = 0;
+                outputCounter = 0;
             }
 
         }
-
+        hw.SetLed(onsetDetected);
         hw.DelayMs(1);
     }
 }
