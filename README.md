@@ -1,5 +1,5 @@
 # CoJam-Firmware
-Real-time BPM detection for Daisy Seed. hey whats up
+Real-time BPM detection for Daisy Seed.
 
 ## Prerequisites
 
