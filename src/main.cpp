@@ -17,6 +17,22 @@ static constexpr float THRESHOLD_FACTOR = 2.0f; // onset detection threshold
 static constexpr size_t FLUX_HISTORY_SIZE = 64U; // ~0.7 second history
 static constexpr size_t MIN_ONSET_INTERVAL = 8U; // minimum frames between onsets for debouncing
 
+static constexpr float FRAME_RATE = SAMPLE_RATE / (float)HOP_SIZE;
+static constexpr float BPM_SMOOTHING_FACTOR = 0.1f;
+
+// Autocorrelation constants
+static constexpr float BPM_MIN = 60.0f;
+static constexpr float BPM_MAX = 180.0f;
+static constexpr float PREFERRED_BPM_MIN = 70.0f;
+static constexpr float PREFERRED_BPM_MAX = 140.0f;
+static constexpr size_t ODF_HISTORY_SIZE = 384U;
+static constexpr size_t MIN_LAG = 31U;           // minimum lag for autocorrelation
+static constexpr size_t MAX_LAG = 94U;           // maximum lag for autocorrelation
+static float odfHistory[ODF_HISTORY_SIZE] = {0};
+static size_t odfHistoryIdx = 0U;
+static float autocorr[MAX_LAG + 1] = {0};
+
+
 // GLOBAL VARIABLES
 static float mono_buffer[BUFFER_SIZE];
 static volatile size_t buf_write = 0U;
@@ -37,6 +53,181 @@ static uint32_t framesSinceOnset = 0U;
 static uint32_t onsetCount = 0U;
 static bool onsetDetected = false;
 static uint32_t frameCount = 0U;
+
+static float currentBPM = 0.0f;
+static float smoothedBPM = 0.0f;
+static size_t dominantLag = 0U;
+static float bpmConfidence = 0.0f;
+
+// start autocorrelation funcs
+
+static void updateODFHistory(void) // update onset detection function history
+{
+    odfHistory[odfHistoryIdx] = currentFlux;
+    odfHistoryIdx = (odfHistoryIdx + 1) % ODF_HISTORY_SIZE; 
+}
+
+static void calcAutocorrelation(void)
+{
+    for (size_t lag = MIN_LAG; lag <= MAX_LAG; lag++)
+    {
+        float sum = 0.0f;
+        size_t count = 0;
+
+        for (size_t i = 0; i < ODF_HISTORY_SIZE - lag; i++)
+        {
+            size_t idx1 = (odfHistoryIdx + i) % ODF_HISTORY_SIZE;
+            size_t idx2 = (odfHistoryIdx + i + lag) % ODF_HISTORY_SIZE;
+
+            sum += odfHistory[idx1] * odfHistory[idx2];
+            count++;
+        }
+        if (count > 0U)
+        {
+            autocorr[lag] = sum / (float)count;
+        } else {
+            autocorr[lag] = 0.0f;
+        }
+    }
+}
+
+static void findDominantLag(void)
+{
+    float maxCorr = 0.0f;
+    size_t maxLag = MIN_LAG;
+
+    for (size_t lag = MIN_LAG; lag <= MAX_LAG; lag++)
+    {
+        if (autocorr[lag] > maxCorr)
+        {
+            maxCorr = autocorr[lag];
+            maxLag = lag;
+        }
+    }
+
+    dominantLag = maxLag;
+
+    float meanCorr = 0.0f;
+
+    for (size_t lag = MIN_LAG; lag <= MAX_LAG; lag++)
+    {
+        meanCorr += autocorr[lag];
+    }
+
+    meanCorr /= (float)(MAX_LAG - MIN_LAG + 1U);
+
+    if (meanCorr > 0.0f)
+    {
+        bpmConfidence = maxCorr / meanCorr;
+    } else 
+    {
+        bpmConfidence = 0.0f;
+    }
+
+}
+
+static float lagToBPM (size_t lag)
+{
+    if (lag == 0U)
+    {
+        return 0.0f;
+    }
+    else 
+    {
+        return (60.0f * FRAME_RATE) / (float)lag;
+    }
+}
+
+static float applyOctaveCorrection (float bpm) // applying double time or half time check
+{
+    float fixedBPM = bpm;
+
+    while (fixedBPM > PREFERRED_BPM_MAX && fixedBPM > BPM_MIN * 2.0f)
+    {
+        fixedBPM *= 0.5f;
+    }
+
+    while (fixedBPM < PREFERRED_BPM_MIN && fixedBPM < BPM_MAX * 0.5f)
+    {
+        fixedBPM *= 2.0f;
+    }
+
+    return fixedBPM;
+}
+
+static float smartOctaveCorrection (float bpm, size_t lag) // more advanced double/half time check
+{
+    float halfLag = (float)lag * 2.0f; // half tempo -> double lag
+    float doubleLag = (float)lag * 0.5f; // double tempo -> half lag
+
+    float currentStrength = autocorr[lag];
+
+    if (halfLag <= MAX_LAG && halfLag >= MIN_LAG)
+    {
+        size_t halfLagInt = (size_t)halfLag;
+        float halfStrength = autocorr[halfLagInt];
+        float halfBPM = lagToBPM(halfLagInt);
+
+        if (halfBPM >= PREFERRED_BPM_MIN && halfBPM <= PREFERRED_BPM_MAX)
+        {
+            if (halfStrength > currentStrength * 0.7f) // CHECKING STRENGTH OF HALFTIME BPM
+            {
+                return halfBPM;
+            }
+        }
+    }
+
+    if (doubleLag <= MAX_LAG && doubleLag >= MIN_LAG)
+    {
+        size_t doubleLagInt = (size_t)doubleLag;
+        float doubleStrength = autocorr[doubleLagInt];
+        float doubleBPM = lagToBPM(doubleLagInt);
+
+        if (doubleBPM >= PREFERRED_BPM_MIN && doubleBPM <= PREFERRED_BPM_MAX)
+        {
+            if (doubleStrength > currentStrength * 0.7f) // CHECKING STRENGTH OF DOUBLETIME BPM
+            {
+                return doubleBPM;
+            }
+        }
+    }
+
+    return applyOctaveCorrection(bpm); // fallback
+}
+
+static void calcBPM (void)
+{
+    static uint32_t bpmCalcCounter = 0U;
+    bpmCalcCounter++;
+
+    if (bpmCalcCounter < 47U)
+    {
+        return;
+    }
+    bpmCalcCounter = 0U;
+
+    if (frameCount < ODF_HISTORY_SIZE)
+    {
+        return;
+    }
+
+    calcAutocorrelation();
+    findDominantLag();
+
+    float rawBPM = lagToBPM(dominantLag);
+    currentBPM = smartOctaveCorrection(rawBPM, dominantLag);
+
+    if (smoothedBPM == 0.0f)
+    {
+        smoothedBPM = currentBPM;
+    }
+    else
+    {
+        smoothedBPM = smoothedBPM + BPM_SMOOTHING_FACTOR * (currentBPM - smoothedBPM);
+    }
+}
+
+// end autocorrelation funcs
 
 static float calcSpectralFlux(void)
 {
@@ -110,6 +301,9 @@ static void processFrame(void)
     detectOnset();
     memcpy(prev_mag, fft_output_mag, (FFT_SIZE / 2) * sizeof(float));
 
+    updateODFHistory();
+    calcBPM();
+
     // Briefly disable interrupts as samples_available is a shared variable
     uint32_t primask = __get_PRIMASK(); // Get current interrupt state
     __disable_irq(); // Disable interrupts
@@ -148,6 +342,29 @@ static void outputFlux(void)
     int32_t onset_int = onsetDetected ? 1 : 0;
 
     hw.PrintLine("FLUX,%ld,%ld,%ld", flux_int, thresh_int, onset_int);
+}
+
+static void outputBPM(void)
+{
+    int32_t bpm_int = (int32_t)(smoothedBPM * 10.0f);  // 1 decimal place
+    int32_t conf_int = (int32_t)(bpmConfidence * 100.0f);
+    int32_t raw_int = (int32_t)(currentBPM * 10.0f);
+    
+    hw.PrintLine("BPM,%ld.%ld,%ld,%ld.%ld", 
+                 bpm_int / 10, bpm_int % 10,
+                 conf_int,
+                 raw_int / 10, raw_int % 10);
+}
+
+static void outputAutocorr(void) 
+{
+    hw.Print("ACORR");
+    for (size_t lag = MIN_LAG; lag <= MAX_LAG; lag += 2)  // Decimated
+    {
+        int32_t corr_int = (int32_t)(autocorr[lag] / 1000.0f);  // Scale down
+        hw.Print(",%ld", corr_int);
+    }
+    hw.PrintLine("");
 }
 
 void errorLED(void)
@@ -218,10 +435,14 @@ int main(void)
 
             outputCounter++;
 
-            if (outputCounter % 4 == 0)
+            if ((outputCounter % 4U) == 0)
             {
-                // outputSpectrum();
                 outputFlux();
+            }
+
+            if ((outputCounter % 16U) == 0)
+            {
+                outputBPM();
             }
 
             outputOnset();
