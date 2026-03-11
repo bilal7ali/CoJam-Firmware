@@ -12,3 +12,6 @@ build/
 # Debug files
 *.o
 *.d
+
+# Virtual Environments
+venv/
