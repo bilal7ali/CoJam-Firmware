@@ -1,6 +1,7 @@
 #include "daisy_seed.h"
 #include "arm_math.h"
 #include "dev/lcd_hd44780.h"
+#include "step_buttons.h"
 #include <vector>
 #include <algorithm>
 
@@ -171,8 +172,6 @@ static void Callback(AudioHandle::InputBuffer   in,
 
     for (size_t i = 0U; i < size; i++)
     {
-        hw.Print(",%ld", in[0][i]);
-
         //todo: change to use only left channel in/out
         out[0][i] = in[0][i]; // pass through audio
         out[1][i] = in[1][i];
@@ -190,8 +189,6 @@ static void Callback(AudioHandle::InputBuffer   in,
 
 int main(void)
 {
-
-
     // Declare a variable to store the state we want to set for the LED.
     bool led_state;
     led_state = true;
@@ -199,23 +196,16 @@ int main(void)
     // Configure and Initialize the Daisy Seed
     hw.Init();
     hw.SetAudioBlockSize(BLOCK_SIZE);
-    hw.StartLog(false);
+    hw.StartLog(true);
     load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 
-        // Configure the LCD
+    // Configure the LCD
     LcdHD44780::Config lcd_config;
     lcd_config.cursor_on    = false;
     lcd_config.cursor_blink = false;
-
     // Assign GPIO pins (adjust pin numbers to match your wiring)
-
-    //VDD -> VDD
-    //GND -> GND
-    //RW -> GND
     lcd_config.rs = seed::D2;  // -> RS pin
     lcd_config.en = seed::D3;  // -> EN pin
-
-
     lcd_config.d4 = seed::D4;  // -> D4 pin
     lcd_config.d5 = seed::D5;  // -> D5 pin
     lcd_config.d6 = seed::D6;  // -> D6 pin
@@ -224,12 +214,6 @@ int main(void)
     // Initialize and use the LCD
     LcdHD44780 lcd;
     lcd.Init(lcd_config);
-    // while (1)
-    // {
-        // lcd.SetCursor(0, 0);    // Row 0, Column 0
-    //     lcd.Print("Marty");  
-    // }
-    
 
     arm_hanning_f32(hann_window, FFT_SIZE); // generate Hann window
     arm_status fft_init_status = arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
@@ -252,72 +236,90 @@ int main(void)
     onsetTimes.reserve(20);
     intervalTimes.reserve(19);
 
+    StepButtons step_buttons;
+    step_buttons.Init(seed::D8, seed::D9);
+    
+    hw.PrintLine("About to enter main loop");
+
+    //main loop
     while(true)
     {
-
-        if (onsetTimes.size() == 20) onsetTimes.erase(onsetTimes.begin());
-        onsetTimes.push_back(frameCount);
-        
-        if (onsetTimes.size() > 2)
+        if (step_buttons.is_listen_button_pressed())
         {
-            
-            float totalIntervalTime;
-            for (size_t i = 0; i < onsetTimes.size(); i++)
-            {
-                if (i == onsetTimes.size() - 1) continue;
+            hw.PrintLine("Listen Button is pressed");
+        } 
 
-                int intervalFrame = onsetTimes[i+1] - onsetTimes[i];
-                float intervalMilliseconds = (intervalFrame * 1000) / FRAME_RATE;
-
-                totalIntervalTime += intervalMilliseconds;
-                intervalTimes.push_back(intervalMilliseconds);
-            }
-
-            std::sort(intervalTimes.begin(), intervalTimes.end());
-            float median;
-            
-            if (intervalTimes.size() % 2 == 1) {
-                median = intervalTimes[intervalTimes.size() / 2]; // clear middle element
-            } else {
-                median = (intervalTimes[intervalTimes.size() / 2] + intervalTimes[(intervalTimes.size() / 2) - 1]) / 2; //average of two middle elements
-            }
-
-            float estimatedBPM;
-
-            if (median == 0) {
-                estimatedBPM = 0.0f;
-            } else {
-                estimatedBPM = 60000 / median;
-            }
-
-            hw.PrintLine("BPM Value: %.2f", estimatedBPM);
-            lcd.SetCursor(0, 0);
-            lcd.PrintInt((int)estimatedBPM);
-
-            intervalTimes.clear();
-        }
-
-        while (samples_available >= FFT_SIZE)
+        if (step_buttons.is_playback_button_pressed())
         {
-            processFrame();
+            hw.PrintLine("Playback button is pressed");
+        } 
 
-            outputCounter++;
-
-            if (outputCounter % 4 == 0)
-            {
-                // outputSpectrum();
-                outputFlux();
-            }
-
-            outputOnset();
-
-            if (outputCounter >= 1000U)
-            {
-                outputCounter = 0;
-            }
-
-        }
-        hw.SetLed(onsetDetected);
-        hw.DelayMs(1);
     }
+
+
+    //     if (onsetTimes.size() == 20) onsetTimes.erase(onsetTimes.begin());
+    //     onsetTimes.push_back(frameCount);
+        
+    //     if (onsetTimes.size() > 2)
+    //     {
+            
+    //         float totalIntervalTime;
+    //         for (size_t i = 0; i < onsetTimes.size(); i++)
+    //         {
+    //             if (i == onsetTimes.size() - 1) continue;
+
+    //             int intervalFrame = onsetTimes[i+1] - onsetTimes[i];
+    //             float intervalMilliseconds = (intervalFrame * 1000) / FRAME_RATE;
+
+    //             totalIntervalTime += intervalMilliseconds;
+    //             intervalTimes.push_back(intervalMilliseconds);
+    //         }
+
+    //         std::sort(intervalTimes.begin(), intervalTimes.end());
+    //         float median;
+            
+    //         if (intervalTimes.size() % 2 == 1) {
+    //             median = intervalTimes[intervalTimes.size() / 2]; // clear middle element
+    //         } else {
+    //             median = (intervalTimes[intervalTimes.size() / 2] + intervalTimes[(intervalTimes.size() / 2) - 1]) / 2; //average of two middle elements
+    //         }
+
+    //         float estimatedBPM;
+
+    //         if (median == 0) {
+    //             estimatedBPM = 0.0f;
+    //         } else {
+    //             estimatedBPM = 60000 / median;
+    //         }
+
+    //         hw.PrintLine("BPM Value: %.2f", estimatedBPM);
+    //         lcd.SetCursor(0, 0);
+    //         lcd.PrintInt((int)estimatedBPM);
+
+    //         intervalTimes.clear();
+    //     }
+
+    //     while (samples_available >= FFT_SIZE)
+    //     {
+    //         processFrame();
+
+    //         outputCounter++;
+
+    //         if (outputCounter % 4 == 0)
+    //         {
+    //             // outputSpectrum();
+    //             outputFlux();
+    //         }
+
+    //         outputOnset();
+
+    //         if (outputCounter >= 1000U)
+    //         {
+    //             outputCounter = 0;
+    //         }
+
+    //     }
+    //     hw.SetLed(onsetDetected);
+    //     hw.DelayMs(1);
+    // }
 }
