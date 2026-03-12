@@ -199,7 +199,7 @@ int main(void)
     // Configure and Initialize the Daisy Seed
     hw.Init();
     hw.SetAudioBlockSize(BLOCK_SIZE);
-    // hw.StartLog(true);
+    hw.StartLog(false);
     load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 
         // Configure the LCD
@@ -224,11 +224,11 @@ int main(void)
     // Initialize and use the LCD
     LcdHD44780 lcd;
     lcd.Init(lcd_config);
-    while (1)
-    {
-        lcd.SetCursor(0, 0);    // Row 0, Column 0
-        lcd.Print("Marty");  
-    }
+    // while (1)
+    // {
+        // lcd.SetCursor(0, 0);    // Row 0, Column 0
+    //     lcd.Print("Marty");  
+    // }
     
 
     arm_hanning_f32(hann_window, FFT_SIZE); // generate Hann window
@@ -291,6 +291,8 @@ int main(void)
             }
 
             hw.PrintLine("BPM Value: %.2f", estimatedBPM);
+            lcd.SetCursor(0, 0);
+            lcd.PrintInt((int)estimatedBPM);
 
             intervalTimes.clear();
         }
