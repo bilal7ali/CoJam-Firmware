@@ -171,6 +171,9 @@ static void Callback(AudioHandle::InputBuffer   in,
 
     for (size_t i = 0U; i < size; i++)
     {
+        hw.Print(",%ld", in[0][i]);
+
+        //todo: change to use only left channel in/out
         out[0][i] = in[0][i]; // pass through audio
         out[1][i] = in[1][i];
 
