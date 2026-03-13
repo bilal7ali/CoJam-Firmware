@@ -188,16 +188,27 @@ static void Callback(AudioHandle::InputBuffer   in,
 }
 
 //dummy functions for simulating state machine
+bool trackReady = false;
 
-
-bool isTrackReady()
+void startGeneratingTrack()
 {
-    return false;
+    //set some flag in the Callback to begin usb transfer
+    hw.PrintLine("Start generating track");
+    System::Delay(2000);
+
 }
 
-void generateTrack()
+void finishGeneratingTrack()
 {
-    hw.PrintLine("Generating track");
+    trackReady = true;
+    hw.PrintLine("Finish generating track");
+}
+
+void startLoopingTrack()
+{
+    // set some flag in the Callback to continuously read from the buffer
+    // and mix into the incoming guitar
+    hw.PrintLine("Start looping track");
     System::Delay(2000);
 }
 
@@ -266,40 +277,129 @@ int main(void)
     hw.PrintLine("About to enter main loop");
 
     CoJamState current_state = STATE_IDLE;
+    uint32_t start_time;
+    uint32_t now;
+    uint32_t duration = 10000; // 10 seconds
     //main loop
-    //debounce example is in Switch.cpp
-    while(true)
+
+    while(1)
     {
         step_buttons.debounceButtons();
 
-        if (step_buttons.isListenButtonPressed())
+        switch (current_state)
         {
-            hw.PrintLine("Listen");
-        } else if (step_buttons.isPlaybackButtonPressed())
-        {
-            hw.PrintLine("Playback");
+
+            case STATE_IDLE:
+                hw.PrintLine("STATE: Idle");
+
+
+                if (step_buttons.isListenButtonPressed())
+                {
+
+                    startGeneratingTrack();
+                    current_state = STATE_LISTENING;
+                    start_time = System::GetNow(); // code to simulate time to transfer and receive data
+
+                } else if (step_buttons.isPlaybackButtonPressed())
+                {
+
+                    //error mode
+                    hw.PrintLine("No track is available");
+                    System::Delay(2000);
+
+                }
+
+                break;
+
+
+            case STATE_LISTENING:
+                hw.PrintLine("STATE: Listening");
+
+
+                //TODO: add LED flashing
+
+
+                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                {
+                    // add code to stop transfer early
+                    current_state = STATE_IDLE;
+                } else if (step_buttons.isListenButtonPressed())
+                {
+                    //error mode
+                    hw.PrintLine("Still listening");
+                    System::Delay(2000);
+                }
+
+
+                // code to simulate time to transfer and receive data
+                now = System::GetNow();
+                if (now - start_time >= duration) 
+                {
+                    finishGeneratingTrack();
+                    System::Delay(2000);
+                }
+
+
+                if (trackReady)
+                {
+                    current_state = STATE_READY;
+                    trackReady = false;
+                }
+
+                break;
+
+
+            case STATE_READY:
+                hw.PrintLine("STATE: Ready");
+
+
+                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                {
+                    // add code to clear buffer 
+                    current_state = STATE_IDLE;
+                } else if (step_buttons.isListenButtonPressed())
+                {
+
+                    // track can be regenerated if they want
+                    startGeneratingTrack();
+                    current_state = STATE_LISTENING;
+                    start_time = System::GetNow(); // code to simulate time to transfer and receive data
+
+                } else if (step_buttons.isPlaybackButtonPressed())
+                {
+                    startLoopingTrack();
+                    current_state = STATE_PLAYING;
+                }
+
+                break;
+        
+            case STATE_PLAYING:
+                hw.PrintLine("STATE: Playing");
+
+                
+                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                {
+                    // add code to clear buffer and stop looping
+                    current_state = STATE_IDLE;
+                } else if (step_buttons.isPlaybackButtonPressed())
+                {
+                    // error mode
+                    hw.PrintLine("Track already playing");
+                    System::Delay(2000);
+
+                } else if (step_buttons.isListenButtonPressed())
+                {
+                    // track can be regenerated if they want
+                    startGeneratingTrack();
+                    start_time = System::GetNow(); // code to simulate time to transfer and receive data
+                    current_state = STATE_LISTENING;
+                }
+
+                break;
+                
+
         }
-        // switch (current_state)
-        // {
-        //     case STATE_IDLE:
-        //         if (step_buttons.isListenButtonPressed())
-        //         {
-        //             hw.PrintLine("Listening for 2 seconds");
-        //             System::Delay(2000);
-        //         } else if (step_buttons.isPlaybackButtonPressed() && !isTrackReady)
-        //         {
-        //             //error mode
-        //             hw.PrintLine("No track ready at this time");
-        //             System::Delay(2000);
-
-        //         } else if (step_buttons.isPlaybackButtonPressed() && isTrackReady)
-        //         {
-        //             current_state = STATE_PLAYING;
-        //             generateTrack();
-        //         }
-
-        // }
-    }
+    }    
 
 
     //     if (onsetTimes.size() == 20) onsetTimes.erase(onsetTimes.begin());
