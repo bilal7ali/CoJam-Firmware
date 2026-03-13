@@ -187,6 +187,30 @@ static void Callback(AudioHandle::InputBuffer   in,
     load.OnBlockEnd();
 }
 
+//dummy functions for simulating state machine
+
+
+bool isTrackReady()
+{
+    return false;
+}
+
+void generateTrack()
+{
+    hw.PrintLine("Generating track");
+    System::Delay(2000);
+}
+
+
+typedef enum {
+    STATE_IDLE,
+    STATE_LISTENING,
+    STATE_READY,
+    STATE_PLAYING,
+    STATE_ERROR
+} CoJamState;
+
+
 int main(void)
 {
     // Declare a variable to store the state we want to set for the LED.
@@ -241,19 +265,40 @@ int main(void)
     
     hw.PrintLine("About to enter main loop");
 
+    CoJamState current_state = STATE_IDLE;
     //main loop
+    //debounce example is in Switch.cpp
     while(true)
     {
-        if (step_buttons.is_listen_button_pressed())
-        {
-            hw.PrintLine("Listen Button is pressed");
-        } 
+        step_buttons.debounceButtons();
 
-        if (step_buttons.is_playback_button_pressed())
+        if (step_buttons.isListenButtonPressed())
         {
-            hw.PrintLine("Playback button is pressed");
-        } 
+            hw.PrintLine("Listen");
+        } else if (step_buttons.isPlaybackButtonPressed())
+        {
+            hw.PrintLine("Playback");
+        }
+        // switch (current_state)
+        // {
+        //     case STATE_IDLE:
+        //         if (step_buttons.isListenButtonPressed())
+        //         {
+        //             hw.PrintLine("Listening for 2 seconds");
+        //             System::Delay(2000);
+        //         } else if (step_buttons.isPlaybackButtonPressed() && !isTrackReady)
+        //         {
+        //             //error mode
+        //             hw.PrintLine("No track ready at this time");
+        //             System::Delay(2000);
 
+        //         } else if (step_buttons.isPlaybackButtonPressed() && isTrackReady)
+        //         {
+        //             current_state = STATE_PLAYING;
+        //             generateTrack();
+        //         }
+
+        // }
     }
 
 

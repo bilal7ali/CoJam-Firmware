@@ -3,16 +3,26 @@
 
 void StepButtons::Init(const daisy::Pin &listen_pin, const daisy::Pin &playback_pin)
 {
-    step_button_listen.Init(listen_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
-    step_button_playback.Init(playback_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
+    // step_button_listen.Init(listen_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
+    // step_button_playback.Init(playback_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
+    step_button_listen.Init(listen_pin, 1000.0f);
+    step_button_playback.Init(playback_pin, 1000.0f);
+
 }
 
-bool StepButtons::is_listen_button_pressed()
+bool StepButtons::isListenButtonPressed()
 {
-    return !step_button_listen.Read();
+    return step_button_listen.Pressed();
 }
 
-bool StepButtons::is_playback_button_pressed()
+bool StepButtons::isPlaybackButtonPressed()
 {
-    return !step_button_playback.Read();
+    return step_button_playback.Pressed();
 }
+
+void StepButtons::debounceButtons()
+{
+    step_button_listen.Debounce();
+    step_button_playback.Debounce();
+}
+
