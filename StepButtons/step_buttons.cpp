@@ -1,4 +1,5 @@
 #include "step_buttons.h"
+// #include "daisy_seed.h"
 #include "daisy_core.h"
 
 void StepButtons::Init(const daisy::Pin &listen_pin, const daisy::Pin &playback_pin)
@@ -25,4 +26,11 @@ void StepButtons::debounceButtons()
     step_button_listen.Debounce();
     step_button_playback.Debounce();
 }
+
+bool StepButtons::isPlaybackHeld()
+{
+    return (step_button_playback.TimeHeldMs() >= reset_time);
+}
+
+
 

@@ -277,6 +277,7 @@ int main(void)
     hw.PrintLine("About to enter main loop");
 
     CoJamState current_state = STATE_IDLE;
+    CoJamState last_state = STATE_ERROR; // Start with dummy value
     uint32_t start_time;
     uint32_t now;
     uint32_t duration = 10000; // 10 seconds
@@ -286,13 +287,19 @@ int main(void)
     {
         step_buttons.debounceButtons();
 
+        // ONLY print when the state changes
+        if (current_state != last_state) {
+            if(current_state == STATE_IDLE) hw.PrintLine("Entering IDLE");
+            if(current_state == STATE_LISTENING) hw.PrintLine("Entering LISTENING");
+            if(current_state == STATE_READY) hw.PrintLine("Entering READY");
+            if(current_state == STATE_PLAYING) hw.PrintLine("Entering PLAYING");
+            last_state = current_state;
+        }
+
         switch (current_state)
         {
 
             case STATE_IDLE:
-                hw.PrintLine("STATE: Idle");
-
-
                 if (step_buttons.isListenButtonPressed())
                 {
 
@@ -313,13 +320,9 @@ int main(void)
 
 
             case STATE_LISTENING:
-                hw.PrintLine("STATE: Listening");
-
 
                 //TODO: add LED flashing
-
-
-                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                if (step_buttons.isPlaybackHeld())
                 {
                     // add code to stop transfer early
                     current_state = STATE_IDLE;
@@ -350,10 +353,8 @@ int main(void)
 
 
             case STATE_READY:
-                hw.PrintLine("STATE: Ready");
 
-
-                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                if (step_buttons.isPlaybackHeld())
                 {
                     // add code to clear buffer 
                     current_state = STATE_IDLE;
@@ -374,10 +375,8 @@ int main(void)
                 break;
         
             case STATE_PLAYING:
-                hw.PrintLine("STATE: Playing");
-
                 
-                if (step_buttons.isListenButtonPressed() && step_buttons.isPlaybackButtonPressed())
+                if (step_buttons.isPlaybackHeld())
                 {
                     // add code to clear buffer and stop looping
                     current_state = STATE_IDLE;
