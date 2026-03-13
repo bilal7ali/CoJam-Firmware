@@ -4,11 +4,8 @@
 
 void StepButtons::Init(const daisy::Pin &listen_pin, const daisy::Pin &playback_pin)
 {
-    // step_button_listen.Init(listen_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
-    // step_button_playback.Init(playback_pin, daisy::GPIO::Mode::INPUT, daisy::GPIO::Pull::PULLUP);
     step_button_listen.Init(listen_pin, 1000.0f);
     step_button_playback.Init(playback_pin, 1000.0f);
-
 }
 
 bool StepButtons::isListenButtonPressed()

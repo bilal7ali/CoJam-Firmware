@@ -2,6 +2,7 @@
 #include "arm_math.h"
 #include "dev/lcd_hd44780.h"
 #include "step_buttons.h"
+#include "step_leds.h"
 #include <vector>
 #include <algorithm>
 
@@ -42,6 +43,8 @@ static uint32_t framesSinceOnset = 0U;
 static uint32_t onsetCount = 0U;
 static bool onsetDetected = false;
 static uint32_t frameCount = 0U;
+
+static volatile float test_input;
 
 static float calcSpectralFlux(void)
 {
@@ -176,6 +179,8 @@ static void Callback(AudioHandle::InputBuffer   in,
         out[0][i] = in[0][i]; // pass through audio
         out[1][i] = in[1][i];
 
+        test_input = in[0][i]; // left stereo input
+
         mono = (in[0][i] + in[1][i]) * 0.5f; // mix to mono
 
         mono_buffer[buf_write] = mono; // add to circular buffer
@@ -195,7 +200,6 @@ void startGeneratingTrack()
     //set some flag in the Callback to begin usb transfer
     hw.PrintLine("Start generating track");
     System::Delay(2000);
-
 }
 
 void finishGeneratingTrack()
@@ -281,8 +285,15 @@ int main(void)
     uint32_t start_time;
     uint32_t now;
     uint32_t duration = 10000; // 10 seconds
-    //main loop
 
+    // GPIO listen_led;
+    // listen_led.Init(daisy::seed::D22, GPIO::Mode::OUTPUT, GPIO::Pull::PULLUP);
+    // System::Delay(500);
+    StepLEDs step_leds;
+    step_leds.Init(daisy::seed::D22, daisy::seed::D23);
+
+
+    //main loop
     while(1)
     {
         step_buttons.debounceButtons();
@@ -300,9 +311,11 @@ int main(void)
         {
 
             case STATE_IDLE:
+                //listen led is solid
+                // step_leds.displayIdleMode();
+
                 if (step_buttons.isListenButtonPressed())
                 {
-
                     startGeneratingTrack();
                     current_state = STATE_LISTENING;
                     start_time = System::GetNow(); // code to simulate time to transfer and receive data
@@ -320,6 +333,9 @@ int main(void)
 
 
             case STATE_LISTENING:
+                // step_leds.displayListeningMode();
+                
+                //flash listen led
 
                 //TODO: add LED flashing
                 if (step_buttons.isPlaybackHeld())
@@ -354,6 +370,12 @@ int main(void)
 
             case STATE_READY:
 
+                hw.PrintLine("Value: %.2f", test_input);
+
+                // step_leds.displayReadyMode();
+
+                // flash playback led
+
                 if (step_buttons.isPlaybackHeld())
                 {
                     // add code to clear buffer 
@@ -375,6 +397,9 @@ int main(void)
                 break;
         
             case STATE_PLAYING:
+                // step_leds.displayPlayingMode();
+
+                // solid playback led
                 
                 if (step_buttons.isPlaybackHeld())
                 {

@@ -3,10 +3,11 @@ TARGET = CoJam-Firmware
 
 # Sources
 CPP_SOURCES = src/main.cpp \
-              StepButtons/step_buttons.cpp
+              StepButtons/step_buttons.cpp \
+              StepLEDs/step_leds.cpp
 
 # Include Paths
-C_INCLUDES += -IStepButtons -Isrc
+C_INCLUDES += -IStepButtons -IStepLEDs -Isrc
 
 # Library Locations
 LIBDAISY_DIR = libDaisy
