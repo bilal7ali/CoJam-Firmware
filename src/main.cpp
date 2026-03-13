@@ -192,7 +192,7 @@ static void Callback(AudioHandle::InputBuffer   in,
 // CoJam-Firmware/libDaisy/doc/md/_a6_Getting-Started-External-SDRAM.md
 
 //USB class usb.cpp
-float DSY_SDRAM_BSS audio_buffer[5];
+float DSY_SDRAM_BSS audio_buffer[BUFFER_SIZE];
 
 
 int main(void)
@@ -211,15 +211,12 @@ int main(void)
     System::Delay(5000);
 
 
-    for 
-    // 3. Manually fill the buffer after Init()
-    audio_buffer[0] = 1.0f;
-    audio_buffer[1] = 2.0f;
-    audio_buffer[2] = 3.0f;
-    audio_buffer[3] = 4.0f;
-    audio_buffer[4] = 5.0f;
+    for (size_t i = 0; i < BUFFER_SIZE; i++)
+    {
+        audio_buffer[i] = ((float)i / BUFFER_SIZE);
+    }
 
-    uint32_t total_samples = 5;
+    uint32_t total_samples = BUFFER_SIZE;
 
     // Send the count first
     hw.usb_handle.TransmitInternal((uint8_t*)&total_samples, sizeof(uint32_t));

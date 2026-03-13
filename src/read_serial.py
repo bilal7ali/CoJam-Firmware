@@ -45,7 +45,7 @@ def receive_daisy_data():
             audio_data = struct.unpack(fmt, raw_payload)
             
             print(f"Successfully saved to {OUT_FILE}")
-            print(f"First 5 samples: {audio_data[:5]}")
+            print(f"Samples: {audio_data}")
 
     except serial.SerialException as e:
         print(f"Serial Error: {e}")
