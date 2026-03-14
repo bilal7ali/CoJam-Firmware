@@ -1,364 +1,226 @@
 #include "daisy_seed.h"
 #include "arm_math.h"
-#include "dev/lcd_hd44780.h"
-#include <vector>
-#include <algorithm>
 
 using namespace daisy;
 
 DaisySeed hw;
-CpuLoadMeter load;
 
-// CONSTANTS
-static constexpr size_t BUFFER_SIZE = 4096U;
-static constexpr float SAMPLE_RATE = 48000.0f;
-static constexpr size_t BLOCK_SIZE = 48U;
-static constexpr size_t FFT_SIZE = 1024U;
-static constexpr size_t HOP_SIZE = 512U;
-static constexpr size_t FRAME_RATE = SAMPLE_RATE / HOP_SIZE;
-static float hann_window[FFT_SIZE];
-static constexpr float THRESHOLD_FACTOR = 2.0f; // onset detection threshold
-static constexpr size_t FLUX_HISTORY_SIZE = 64U; // ~0.7 second history
-static constexpr size_t MIN_ONSET_INTERVAL = 8U; // minimum frames between onsets for debouncing
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-// GLOBAL VARIABLES
-static float mono_buffer[BUFFER_SIZE];
-static volatile size_t buf_write = 0U;
-static volatile size_t samples_available = 0U;
-static arm_rfft_fast_instance_f32 fft_instance;
-static float fft_output[FFT_SIZE];
-static float fft_output_mag[FFT_SIZE / 2];
-static float windowed_samples[FFT_SIZE];
-static float processing_buffer[FFT_SIZE]; // temp linear buffer for FFT processing
-static volatile size_t buf_read = 0U;
-static float prev_mag[FFT_SIZE / 2] = {0};
-static float fluxHistory[FLUX_HISTORY_SIZE] = {0};
-static size_t fluxHistoryIdx = 0U;
-static float fluxMean = 0.0f;
-static float fluxThreshold = 0.0f;
-static float currentFlux = 0.0f;
-static uint32_t framesSinceOnset = 0U;
-static uint32_t onsetCount = 0U;
-static bool onsetDetected = false;
-static uint32_t frameCount = 0U;
+static constexpr float32_t SAMPLE_RATE_HZ   = 48000.0f;
+static constexpr uint32_t  CAPTURE_SECONDS  = 5U;
+static constexpr uint32_t  CAPTURE_SAMPLES  =
+    static_cast<uint32_t>(SAMPLE_RATE_HZ) * CAPTURE_SECONDS; // 240,000
 
-static float calcSpectralFlux(void)
+static constexpr size_t    WAV_HEADER_BYTES   = 44U;
+static constexpr size_t    USB_CHUNK_BYTES    = 2048U;
+static constexpr uint16_t  WAV_FMT_IEEE_FLOAT = 3U;
+static constexpr uint16_t  WAV_MONO           = 1U;
+static constexpr uint16_t  WAV_BITS_32        = 32U;
+static constexpr uint32_t  WAV_FMT_CHUNK_SIZE = 16U;
+static constexpr uint32_t  USB_RETRY_DELAY_US = 200U;
+static constexpr uint32_t  USB_CHUNK_DELAY_US = 100U;
+static constexpr float32_t GAIN               = 10.0f;
+
+// ─── SDRAM capture buffer (~937 KB) ──────────────────────────────────────────
+
+static float32_t DSY_SDRAM_BSS capture_buffer[CAPTURE_SAMPLES];
+
+// ─── Shared capture state (written in IRQ, polled in main) ───────────────────
+
+static volatile uint32_t capture_write_idx = 0U;
+static volatile bool     capture_complete  = false;
+
+// ─── WAV header staging ───────────────────────────────────────────────────────
+
+static uint8_t wav_header_buf[WAV_HEADER_BYTES];
+
+// ─── Preamble constants ───────────────────────────────────────────────────────
+
+static constexpr size_t   PREAMBLE_BYTES       = 8U;
+static constexpr uint8_t  PREAMBLE_MAGIC[4U]   = { 0xC0U, 0x4AU, 0x41U, 0x4DU }; // 0xC0 'J' 'A' 'M'
+
+static uint8_t preamble_buf[PREAMBLE_BYTES];
+
+static void buildPreamble(uint8_t* const buf, const float32_t bpm)
 {
-    float flux = 0.0f;
+    buf[0] = PREAMBLE_MAGIC[0];
+    buf[1] = PREAMBLE_MAGIC[1];
+    buf[2] = PREAMBLE_MAGIC[2];
+    buf[3] = PREAMBLE_MAGIC[3];
 
-    for (size_t i = 0U; i < FFT_SIZE / 2; i++)
+    // Reinterpret the float32 as raw bytes (little-endian, matches ARM)
+    uint32_t bpm_bits;
+    memcpy(&bpm_bits, &bpm, sizeof(uint32_t));
+    buf[4] = (uint8_t)(bpm_bits         & 0xFFU);
+    buf[5] = (uint8_t)((bpm_bits >> 8U)  & 0xFFU);
+    buf[6] = (uint8_t)((bpm_bits >> 16U) & 0xFFU);
+    buf[7] = (uint8_t)((bpm_bits >> 24U) & 0xFFU);
+}
+
+// ─── Internal helpers ────────────────────────────────────────────────────────
+
+static void write_u16_le(uint8_t* const buf, const uint16_t val)
+{
+    buf[0] = (uint8_t)(val         & 0xFFU);
+    buf[1] = (uint8_t)((val >> 8U) & 0xFFU);
+}
+
+static void write_u32_le(uint8_t* const buf, const uint32_t val)
+{
+    buf[0] = (uint8_t)(val          & 0xFFU);
+    buf[1] = (uint8_t)((val >> 8U)  & 0xFFU);
+    buf[2] = (uint8_t)((val >> 16U) & 0xFFU);
+    buf[3] = (uint8_t)((val >> 24U) & 0xFFU);
+}
+
+/**
+ * Populate a 44-byte standard WAV header (IEEE 754 float32, mono).
+ * Layout: RIFF descriptor (12) | fmt sub-chunk (24) | data sub-chunk header (8)
+ */
+static void buildWavHeader(uint8_t* const header,
+                           const uint32_t num_samples,
+                           const uint32_t sample_rate)
+{
+    const uint32_t bytes_per_sample = (uint32_t)sizeof(float32_t); // 4
+    const uint32_t data_size        = num_samples * bytes_per_sample;
+    const uint32_t riff_size        = data_size + 36U;
+    const uint32_t byte_rate        = sample_rate * bytes_per_sample;
+
+    /* RIFF chunk descriptor */
+    header[0]  = (uint8_t)'R'; header[1]  = (uint8_t)'I';
+    header[2]  = (uint8_t)'F'; header[3]  = (uint8_t)'F';
+    write_u32_le(&header[4],  riff_size);
+    header[8]  = (uint8_t)'W'; header[9]  = (uint8_t)'A';
+    header[10] = (uint8_t)'V'; header[11] = (uint8_t)'E';
+
+    /* fmt sub-chunk */
+    header[12] = (uint8_t)'f'; header[13] = (uint8_t)'m';
+    header[14] = (uint8_t)'t'; header[15] = (uint8_t)' ';
+    write_u32_le(&header[16], WAV_FMT_CHUNK_SIZE);
+    write_u16_le(&header[20], WAV_FMT_IEEE_FLOAT);
+    write_u16_le(&header[22], WAV_MONO);
+    write_u32_le(&header[24], sample_rate);
+    write_u32_le(&header[28], byte_rate);
+    write_u16_le(&header[32], (uint16_t)bytes_per_sample); // block align
+    write_u16_le(&header[34], WAV_BITS_32);
+
+    /* data sub-chunk */
+    header[36] = (uint8_t)'d'; header[37] = (uint8_t)'a';
+    header[38] = (uint8_t)'t'; header[39] = (uint8_t)'a';
+    write_u32_le(&header[40], data_size);
+}
+
+/**
+ * Send `total_bytes` of data over USB CDC in USB_CHUNK_BYTES-sized pieces.
+ * Retries on USBD_BUSY without dropping data.
+ *
+ * NOTE: TransmitInternal takes uint8_t* (non-const) due to the libDaisy API.
+ * The buffer is not modified during transmission; the const_cast is intentional
+ * and safe. This is a MISRA-C++ Rule 5-2-5 advisory deviation.
+ */
+static void transmitAll(const uint8_t* const data, const uint32_t total_bytes)
+{
+    uint32_t offset = 0U;
+
+    while (offset < total_bytes)
     {
-        float diff = fft_output_mag[i] - prev_mag[i];
+        const uint32_t remaining   = total_bytes - offset;
+        const size_t   chunk_bytes = (remaining > USB_CHUNK_BYTES)
+                                         ? USB_CHUNK_BYTES
+                                         : (size_t)remaining;
 
-        flux += fmaxf(0.0f, diff);
-    }
+        UsbHandle::Result result;
+        do
+        {
+            result = hw.usb_handle.TransmitInternal(
+                const_cast<uint8_t*>(data + offset),
+                chunk_bytes);
 
-    return flux;
-}
+            if (result != UsbHandle::Result::OK)
+            {
+                System::DelayUs(USB_RETRY_DELAY_US);
+            }
+        }
+        while (result != UsbHandle::Result::OK);
 
-static void updateThreshold(void)
-{
-    fluxHistory[fluxHistoryIdx] = currentFlux;
-    fluxHistoryIdx = (fluxHistoryIdx + 1) % FLUX_HISTORY_SIZE;
-
-    float sum = 0.0f;
-    for (size_t i = 0; i < FLUX_HISTORY_SIZE; i++)
-    {
-        sum += fluxHistory[i];
-    }
-    fluxMean = sum / (float)FLUX_HISTORY_SIZE;
-
-    fluxThreshold = fluxMean * THRESHOLD_FACTOR;
-}
-
-static void detectOnset(void)
-{
-    framesSinceOnset++;
-    onsetDetected = false;
-
-    if ((currentFlux > fluxThreshold) && (framesSinceOnset >= MIN_ONSET_INTERVAL))
-    {
-        onsetDetected = true;
-        framesSinceOnset = 0;
-        onsetCount++;
+        offset += chunk_bytes;
+        System::DelayUs(USB_CHUNK_DELAY_US);
     }
 }
 
-// Unwrap a circular buffer to format in contiguous linear buffer
-static void unwrap_buffer(float* dest, const float* src, size_t start_idx, size_t len, size_t total_size)
+
+// ─── Audio callback ──────────────────────────────────────────────────────────
+
+static void AudioCallback(AudioHandle::InputBuffer  in,
+                          AudioHandle::OutputBuffer out,
+                          size_t                    size)
 {
-    size_t first_part = total_size - start_idx;
-    if (len < first_part)
-    {
-        memcpy(dest, &src[start_idx], len * sizeof(float));
-    }
-    else
-    {
-        memcpy(dest, &src[start_idx], first_part * sizeof(float));
-        memcpy(&dest[first_part], &src[0], (len - first_part) * sizeof(float));
-    }
-}
-
-static void processFrame(void)
-{
-    unwrap_buffer(processing_buffer, mono_buffer, buf_read, FFT_SIZE, BUFFER_SIZE); // Unwrap circular buffer
-
-    arm_mult_f32(processing_buffer, hann_window, windowed_samples, FFT_SIZE); // Apply Hann window to smooth edges of signal
-    arm_rfft_fast_f32(&fft_instance, windowed_samples, fft_output, 0); // Compute FFT on windowed samples
-    arm_cmplx_mag_f32(fft_output, fft_output_mag, FFT_SIZE/2); // Compute magnitude spectrum
-
-    buf_read = (buf_read + HOP_SIZE) % BUFFER_SIZE; // Update read pointer
-
-    currentFlux = calcSpectralFlux();
-    updateThreshold();
-    detectOnset();
-    memcpy(prev_mag, fft_output_mag, (FFT_SIZE / 2) * sizeof(float));
-
-    // Briefly disable interrupts as samples_available is a shared variable
-    uint32_t primask = __get_PRIMASK(); // Get current interrupt state
-    __disable_irq(); // Disable interrupts
-    samples_available -= HOP_SIZE; // Update samples available
-    __set_PRIMASK(primask); // Restore interrupt state to previous state
-
-    frameCount++;
-}
-
-static void outputSpectrum(void)
-{
-    hw.Print("SPEC");
-
-    // Output every 2nd bin (256 values instead of 512)
-    for (size_t i = 0U; i < FFT_SIZE / 2; i += 2)
-    {
-        int32_t mag = (int32_t)(fft_output_mag[i] * 10000.0f);
-        hw.Print(",%ld", mag);
-    }
-    // hw.PrintLine("");
-}
-
-static void outputOnset(void)
-{
-    if (onsetDetected)
-    {
-        int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
-        // hw.PrintLine("ONSET,%lu,%ld,%lu", frameCount, flux_int, onsetCount);
-    }
-}
-
-static void outputFlux(void)
-{
-    int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
-    int32_t thresh_int = (int32_t)(fluxThreshold * 1000.0f);
-    int32_t onset_int = onsetDetected ? 1 : 0;
-
-    // hw.PrintLine("FLUX,%ld,%ld,%ld", flux_int, thresh_int, onset_int);
-}
-
-void errorLED(void)
-{
-        hw.SetLed(true);
-        hw.DelayMs(100);
-        hw.SetLed(false);
-        hw.DelayMs(100);
-}
-
-static void Callback(AudioHandle::InputBuffer   in,
-                     AudioHandle::OutputBuffer  out,
-                     size_t                     size)
-{
-    load.OnBlockStart();
-    float mono = 0.0f;
-
     for (size_t i = 0U; i < size; i++)
     {
-        hw.Print(",%ld", in[0][i]);
+        out[0][i] = in[0][i]; // pass-through left channel (guitar input)
+        out[1][i] = 0.0f;     // silence right channel
 
-        //todo: change to use only left channel in/out
-        out[0][i] = in[0][i]; // pass through audio
-        out[1][i] = in[1][i];
+        if (!capture_complete)
+        {
+            capture_buffer[capture_write_idx] = fmaxf(-1.0f, fminf(1.0f, in[0][i] * GAIN));
+            capture_write_idx++;
 
-        mono = (in[0][i] + in[1][i]) * 0.5f; // mix to mono
-
-        mono_buffer[buf_write] = mono; // add to circular buffer
-        buf_write = (buf_write + 1U) % BUFFER_SIZE;
-
-        samples_available++;    // consider editing this to make it safer at some point in future
-                                // this could cause issues if main loop starts stalling
+            if (capture_write_idx >= CAPTURE_SAMPLES)
+            {
+                capture_complete = true;
+            }
+        }
     }
-    load.OnBlockEnd();
 }
 
-// SDRAM info available here:
-// CoJam-Firmware/libDaisy/doc/md/_a6_Getting-Started-External-SDRAM.md
 
-//USB class usb.cpp
-float DSY_SDRAM_BSS audio_buffer[BUFFER_SIZE];
-
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
-    // Declare a variable to store the state we want to set for the LED.
-    bool led_state;
-    led_state = true;
-
-    // Configure and Initialize the Daisy Seed
     hw.Init();
-    hw.StartLog(false);
-    // hw.PrintLine("Sending data now");
+    hw.SetAudioBlockSize(48U);
 
+    // Do NOT call hw.StartLog() — mixing text logging with raw binary
+    // USB transmission on the same CDC endpoint corrupts the WAV stream.
     hw.usb_handle.Init(UsbHandle::FS_INTERNAL);
 
-    System::Delay(5000);
+    // Allow USB to enumerate on the host before transmitting
+    System::Delay(3000U);
 
+    // Single blink = "capture starting"
+    hw.SetLed(true);  System::Delay(200U);
+    hw.SetLed(false);
 
-    for (size_t i = 0; i < BUFFER_SIZE; i++)
+    // Audio starts and runs indefinitely — pass-through is always active
+    hw.StartAudio(AudioCallback);
+
+    // Block until capture buffer is full (~5 seconds)
+    // Guitar pass-through continues uninterrupted during this wait
+    while (!capture_complete) { /* spin */ }
+
+    // Flush D-cache before USB DMA reads from SDRAM.
+    // The audio callback has made its last write to capture_buffer
+    // (guarded by capture_complete), so this is race-free.
+    SCB_CleanDCache();
+
+    const float32_t detected_bpm = 120.0f;
+
+    buildPreamble(preamble_buf, detected_bpm);
+    transmitAll(preamble_buf, (uint32_t)PREAMBLE_BYTES);
+
+    buildWavHeader(wav_header_buf,
+                CAPTURE_SAMPLES,
+                static_cast<uint32_t>(SAMPLE_RATE_HZ));
+    transmitAll(wav_header_buf, (uint32_t)WAV_HEADER_BYTES);
+    transmitAll(reinterpret_cast<const uint8_t*>(capture_buffer),
+            CAPTURE_SAMPLES * (uint32_t)sizeof(float32_t));
+
+    // Rapid blink = "transmission complete"; guitar still passes through
+    while (true)
     {
-        audio_buffer[i] = ((float)i / BUFFER_SIZE);
+        hw.SetLed(true);  System::Delay(100U);
+        hw.SetLed(false); System::Delay(100U);
     }
-
-    uint32_t total_samples = BUFFER_SIZE;
-
-    // Send the count first
-    hw.usb_handle.TransmitInternal((uint8_t*)&total_samples, sizeof(uint32_t));
-
-
-    System::Delay(10);
-
-    // Then send the data
-    hw.usb_handle.TransmitInternal((uint8_t*)audio_buffer, total_samples * sizeof(float));
-
-    // char msg[] = "Hello from Daisy SDRAM!\r\n";
-    // while(1) {
-    //     // Transmit the message
-    //     // Cast to uint8_t* as required by the class definition
-    //     hw.usb_handle.TransmitInternal((uint8_t*)msg, strlen(msg));
-
-    //     // Delay to avoid flooding the serial port
-    //     System::Delay(1000);
-    // }
-
-
-
-
-    // hw.SetAudioBlockSize(BLOCK_SIZE);
-    // load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
-
-    //     // Configure the LCD
-    // LcdHD44780::Config lcd_config;
-    // lcd_config.cursor_on    = false;
-    // lcd_config.cursor_blink = false;
-
-    // // Assign GPIO pins (adjust pin numbers to match your wiring)
-
-    // //VDD -> VDD
-    // //GND -> GND
-    // //RW -> GND
-    // lcd_config.rs = seed::D2;  // -> RS pin
-    // lcd_config.en = seed::D3;  // -> EN pin
-
-
-    // lcd_config.d4 = seed::D4;  // -> D4 pin
-    // lcd_config.d5 = seed::D5;  // -> D5 pin
-    // lcd_config.d6 = seed::D6;  // -> D6 pin
-    // lcd_config.d7 = seed::D7;  // -> D7 pin
-
-    // // Initialize and use the LCD
-    // LcdHD44780 lcd;
-    // lcd.Init(lcd_config);
-    // // while (1)
-    // // {
-    //     // lcd.SetCursor(0, 0);    // Row 0, Column 0
-    // //     lcd.Print("Marty");  
-    // // }
-    
-
-    // arm_hanning_f32(hann_window, FFT_SIZE); // generate Hann window
-    // arm_status fft_init_status = arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
-
-    // if (fft_init_status != ARM_MATH_SUCCESS) // initialize FFT
-    // {
-    // // hw.PrintLine("FFT INIT ERROR: %d", (int)fft_init_status);
-    //     while (1)
-    //     {
-    //         errorLED();
-    //     }
-    // }
-
-    // hw.StartAudio(Callback);
-
-    // uint32_t outputCounter = 0U;
-
-    // std::vector<int> onsetTimes;
-    // std::vector<float> intervalTimes;
-    // onsetTimes.reserve(20);
-    // intervalTimes.reserve(19);
-
-    // while(true)
-    // {
-
-    //     if (onsetTimes.size() == 20) onsetTimes.erase(onsetTimes.begin());
-    //     onsetTimes.push_back(frameCount);
-        
-    //     if (onsetTimes.size() > 2)
-    //     {
-            
-    //         float totalIntervalTime;
-    //         for (size_t i = 0; i < onsetTimes.size(); i++)
-    //         {
-    //             if (i == onsetTimes.size() - 1) continue;
-
-    //             int intervalFrame = onsetTimes[i+1] - onsetTimes[i];
-    //             float intervalMilliseconds = (intervalFrame * 1000) / FRAME_RATE;
-
-    //             totalIntervalTime += intervalMilliseconds;
-    //             intervalTimes.push_back(intervalMilliseconds);
-    //         }
-
-    //         std::sort(intervalTimes.begin(), intervalTimes.end());
-    //         float median;
-            
-    //         if (intervalTimes.size() % 2 == 1) {
-    //             median = intervalTimes[intervalTimes.size() / 2]; // clear middle element
-    //         } else {
-    //             median = (intervalTimes[intervalTimes.size() / 2] + intervalTimes[(intervalTimes.size() / 2) - 1]) / 2; //average of two middle elements
-    //         }
-
-    //         float estimatedBPM;
-
-    //         if (median == 0) {
-    //             estimatedBPM = 0.0f;
-    //         } else {
-    //             estimatedBPM = 60000 / median;
-    //         }
-
-    //         hw.PrintLine("BPM Value: %.2f", estimatedBPM);
-    //         lcd.SetCursor(0, 0);
-    //         lcd.PrintInt((int)estimatedBPM);
-
-    //         intervalTimes.clear();
-    //     }
-
-    //     while (samples_available >= FFT_SIZE)
-    //     {
-    //         processFrame();
-
-    //         outputCounter++;
-
-    //         if (outputCounter % 4 == 0)
-    //         {
-    //             // outputSpectrum();
-    //             outputFlux();
-    //         }
-
-    //         outputOnset();
-
-    //         if (outputCounter >= 1000U)
-    //         {
-    //             outputCounter = 0;
-    //         }
-
-    //     }
-    //     hw.SetLed(onsetDetected);
-    //     hw.DelayMs(1);
-    // }
 }
