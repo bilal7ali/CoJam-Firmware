@@ -57,7 +57,7 @@ int main(void)
 {
     hw.Init();
     hw.SetAudioBlockSize(BLOCK_SIZE);
-    hw.StartLog(true);
+    hw.StartLog(false);
     load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
 
     hw.StartAudio(Callback);
@@ -68,10 +68,10 @@ int main(void)
         {
             const float* const buf = read_buf;
 
-            for (size_t i = 0U; i < CAPTURE_SIZE; i++)
-            {
-                hw.PrintLine("%.6f", buf[i]);
-            }
+            // for (size_t i = 0U; i < CAPTURE_SIZE; i++)
+            // {
+            //     //hw.PrintLine("%.6f", buf[i]);
+            // }
 
             capture_ready = false;  // release ISR to fill next capture
         }
