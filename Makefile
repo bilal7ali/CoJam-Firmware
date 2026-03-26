@@ -2,7 +2,11 @@
 TARGET = CoJam-Firmware
 
 # Sources
-CPP_SOURCES = src/main.cpp
+CPP_SOURCES = \
+src/main.cpp \
+src/usb_audio.cpp \
+src/step_buttons.cpp \
+src/step_leds.cpp
 
 # Library Locations
 LIBDAISY_DIR = libDaisy

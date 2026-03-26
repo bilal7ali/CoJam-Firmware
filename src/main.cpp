@@ -1,323 +1,326 @@
 #include "daisy_seed.h"
 #include "arm_math.h"
 #include "dev/lcd_hd44780.h"
-#include <vector>
-#include <algorithm>
+#include "step_buttons.h"
+#include "usb_audio.h"
+#include <stdio.h>
+#include "step_leds.h"
 
-using namespace daisy;
-
-DaisySeed hw;
-CpuLoadMeter load;
+static daisy::DaisySeed hw;
+static StepButtons      step_buttons;
+static StepLEDs         step_leds;
 
 // CONSTANTS
-static constexpr size_t BUFFER_SIZE = 4096U;
-static constexpr float SAMPLE_RATE = 48000.0f;
-static constexpr size_t BLOCK_SIZE = 48U;
-static constexpr size_t FFT_SIZE = 1024U;
-static constexpr size_t HOP_SIZE = 512U;
-static constexpr size_t FRAME_RATE = SAMPLE_RATE / HOP_SIZE;
-static float hann_window[FFT_SIZE];
-static constexpr float THRESHOLD_FACTOR = 2.0f; // onset detection threshold
-static constexpr size_t FLUX_HISTORY_SIZE = 64U; // ~0.7 second history
-static constexpr size_t MIN_ONSET_INTERVAL = 8U; // minimum frames between onsets for debouncing
+static constexpr uint32_t AUDIO_BLOCK_SIZE           = 48U;
+static constexpr uint32_t USB_STARTUP_DELAY_MS       = 3000U;
+static constexpr uint32_t LED_BLINK_INTERVAL_MS      = 50U;
+static constexpr uint32_t DISPLAY_UPDATE_INTERVAL_MS = 250U;
 
-// GLOBAL VARIABLES
-static float mono_buffer[BUFFER_SIZE];
-static volatile size_t buf_write = 0U;
-static volatile size_t samples_available = 0U;
-static arm_rfft_fast_instance_f32 fft_instance;
-static float fft_output[FFT_SIZE];
-static float fft_output_mag[FFT_SIZE / 2];
-static float windowed_samples[FFT_SIZE];
-static float processing_buffer[FFT_SIZE]; // temp linear buffer for FFT processing
-static volatile size_t buf_read = 0U;
-static float prev_mag[FFT_SIZE / 2] = {0};
-static float fluxHistory[FLUX_HISTORY_SIZE] = {0};
-static size_t fluxHistoryIdx = 0U;
-static float fluxMean = 0.0f;
-static float fluxThreshold = 0.0f;
-static float currentFlux = 0.0f;
-static uint32_t framesSinceOnset = 0U;
-static uint32_t onsetCount = 0U;
-static bool onsetDetected = false;
-static uint32_t frameCount = 0U;
-
-static float calcSpectralFlux(void)
+// STATES
+enum class CoJamState : uint8_t
 {
-    float flux = 0.0f;
+    IDLE      = 0U,
+    LISTENING = 1U,
+    READY     = 2U,
+    PLAYING   = 3U,
+    PAUSED    = 4U,
+    ERROR     = 5U
+};
 
-    for (size_t i = 0U; i < FFT_SIZE / 2; i++)
-    {
-        float diff = fft_output_mag[i] - prev_mag[i];
+static CoJamState state = CoJamState::IDLE;
+static bool printFlag = false;
+static bool transmitted = false;
+static CoJamState last_state = CoJamState::IDLE;
 
-        flux += fmaxf(0.0f, diff);
-    }
+static daisy::LcdHD44780 lcd;
 
-    return flux;
+static void Display_Init(void)
+{
+    daisy::LcdHD44780::Config cfg;
+    cfg.cursor_on    = false;
+    cfg.cursor_blink = false;
+    cfg.rs = daisy::seed::D2;
+    cfg.en = daisy::seed::D3;
+    cfg.d4 = daisy::seed::D4;
+    cfg.d5 = daisy::seed::D5;
+    cfg.d6 = daisy::seed::D6;
+    cfg.d7 = daisy::seed::D7;
+    lcd.Init(cfg);
 }
 
-static void updateThreshold(void)
+// bpm_x10: smoothedBPM * 10, integer/fractional split avoids float formatting.
+static void Display_Update(const uint32_t bpm_x10)
 {
-    fluxHistory[fluxHistoryIdx] = currentFlux;
-    fluxHistoryIdx = (fluxHistoryIdx + 1) % FLUX_HISTORY_SIZE;
-
-    float sum = 0.0f;
-    for (size_t i = 0; i < FLUX_HISTORY_SIZE; i++)
-    {
-        sum += fluxHistory[i];
-    }
-    fluxMean = sum / (float)FLUX_HISTORY_SIZE;
-
-    fluxThreshold = fluxMean * THRESHOLD_FACTOR;
+    char buf[17U];
+    const uint32_t whole = bpm_x10 / 10U;
+    const uint32_t frac  = bpm_x10 % 10U;
+    sprintf(buf, "BPM:  %3lu.%lu      ", whole, frac);
+    buf[16U] = '\0';
+    lcd.SetCursor(0U, 0U);
+    lcd.Print(buf);
 }
 
-static void detectOnset(void)
+static void blinkError(void)
 {
-    framesSinceOnset++;
-    onsetDetected = false;
-
-    if ((currentFlux > fluxThreshold) && (framesSinceOnset >= MIN_ONSET_INTERVAL))
+    while (true)
     {
-        onsetDetected = true;
-        framesSinceOnset = 0;
-        onsetCount++;
+        hw.SetLed(true);  daisy::System::Delay(LED_BLINK_INTERVAL_MS);
+        hw.SetLed(false); daisy::System::Delay(LED_BLINK_INTERVAL_MS);
     }
 }
 
-// Unwrap a circular buffer to format in contiguous linear buffer
-static void unwrap_buffer(float* dest, const float* src, size_t start_idx, size_t len, size_t total_size)
+static void AudioCallback(daisy::AudioHandle::InputBuffer  in,
+                          daisy::AudioHandle::OutputBuffer out,
+                          size_t                           size)
 {
-    size_t first_part = total_size - start_idx;
-    if (len < first_part)
-    {
-        memcpy(dest, &src[start_idx], len * sizeof(float));
-    }
-    else
-    {
-        memcpy(dest, &src[start_idx], first_part * sizeof(float));
-        memcpy(&dest[first_part], &src[0], (len - first_part) * sizeof(float));
-    }
-}
-
-static void processFrame(void)
-{
-    unwrap_buffer(processing_buffer, mono_buffer, buf_read, FFT_SIZE, BUFFER_SIZE); // Unwrap circular buffer
-
-    arm_mult_f32(processing_buffer, hann_window, windowed_samples, FFT_SIZE); // Apply Hann window to smooth edges of signal
-    arm_rfft_fast_f32(&fft_instance, windowed_samples, fft_output, 0); // Compute FFT on windowed samples
-    arm_cmplx_mag_f32(fft_output, fft_output_mag, FFT_SIZE/2); // Compute magnitude spectrum
-
-    buf_read = (buf_read + HOP_SIZE) % BUFFER_SIZE; // Update read pointer
-
-    currentFlux = calcSpectralFlux();
-    updateThreshold();
-    detectOnset();
-    memcpy(prev_mag, fft_output_mag, (FFT_SIZE / 2) * sizeof(float));
-
-    // Briefly disable interrupts as samples_available is a shared variable
-    uint32_t primask = __get_PRIMASK(); // Get current interrupt state
-    __disable_irq(); // Disable interrupts
-    samples_available -= HOP_SIZE; // Update samples available
-    __set_PRIMASK(primask); // Restore interrupt state to previous state
-
-    frameCount++;
-}
-
-static void outputSpectrum(void)
-{
-    hw.Print("SPEC");
-
-    // Output every 2nd bin (256 values instead of 512)
-    for (size_t i = 0U; i < FFT_SIZE / 2; i += 2)
-    {
-        int32_t mag = (int32_t)(fft_output_mag[i] * 10000.0f);
-        hw.Print(",%ld", mag);
-    }
-    // hw.PrintLine("");
-}
-
-static void outputOnset(void)
-{
-    if (onsetDetected)
-    {
-        int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
-        // hw.PrintLine("ONSET,%lu,%ld,%lu", frameCount, flux_int, onsetCount);
-    }
-}
-
-static void outputFlux(void)
-{
-    int32_t flux_int = (int32_t)(currentFlux * 1000.0f);
-    int32_t thresh_int = (int32_t)(fluxThreshold * 1000.0f);
-    int32_t onset_int = onsetDetected ? 1 : 0;
-
-    // hw.PrintLine("FLUX,%ld,%ld,%ld", flux_int, thresh_int, onset_int);
-}
-
-void errorLED(void)
-{
-        hw.SetLed(true);
-        hw.DelayMs(100);
-        hw.SetLed(false);
-        hw.DelayMs(100);
-}
-
-static void Callback(AudioHandle::InputBuffer   in,
-                     AudioHandle::OutputBuffer  out,
-                     size_t                     size)
-{
-    load.OnBlockStart();
-    float mono = 0.0f;
-
     for (size_t i = 0U; i < size; i++)
     {
-        hw.Print(",%ld", in[0][i]);
+        const float32_t guitar = in[0][i];
 
-        //todo: change to use only left channel in/out
-        out[0][i] = in[0][i]; // pass through audio
-        out[1][i] = in[1][i];
+        UsbAudio_CaptureSample(guitar);
+        // TODO: BpmDetector_PushSample(guitar) once bpm_detector is merged
 
-        mono = (in[0][i] + in[1][i]) * 0.5f; // mix to mono
+        const float32_t drum = UsbAudio_GetPlaybackSample();
 
-        mono_buffer[buf_write] = mono; // add to circular buffer
-        buf_write = (buf_write + 1U) % BUFFER_SIZE;
-
-        samples_available++;    // consider editing this to make it safer at some point in future
-                                // this could cause issues if main loop starts stalling
+        out[0][i] = fmaxf(-1.0f, fminf(1.0f, guitar + drum));
     }
-    load.OnBlockEnd();
 }
 
 int main(void)
 {
-
-
-    // Declare a variable to store the state we want to set for the LED.
-    bool led_state;
-    led_state = true;
-
-    // Configure and Initialize the Daisy Seed
     hw.Init();
-    hw.SetAudioBlockSize(BLOCK_SIZE);
-    hw.StartLog(false);
-    load.Init(hw.AudioSampleRate(), hw.AudioBlockSize());
+    hw.SetAudioBlockSize(AUDIO_BLOCK_SIZE);
 
-        // Configure the LCD
-    LcdHD44780::Config lcd_config;
-    lcd_config.cursor_on    = false;
-    lcd_config.cursor_blink = false;
+    UsbAudio_Init(&hw);
+    daisy::System::Delay(USB_STARTUP_DELAY_MS);
 
-    // Assign GPIO pins (adjust pin numbers to match your wiring)
+    hw.SetLed(true);  daisy::System::Delay(200U);
+    hw.SetLed(false);
 
-    //VDD -> VDD
-    //GND -> GND
-    //RW -> GND
-    lcd_config.rs = seed::D2;  // -> RS pin
-    lcd_config.en = seed::D3;  // -> EN pin
+    step_buttons.Init(daisy::seed::D9, daisy::seed::D8); // listen (B1)
+    step_leds.Init(daisy::seed::D22, daisy::seed::D23); // playback (B2)
 
+    // TODO: BpmDetector_Init() once bpm_detector is merged
+    Display_Init();
 
-    lcd_config.d4 = seed::D4;  // -> D4 pin
-    lcd_config.d5 = seed::D5;  // -> D5 pin
-    lcd_config.d6 = seed::D6;  // -> D6 pin
-    lcd_config.d7 = seed::D7;  // -> D7 pin
+    hw.StartAudio(AudioCallback);
 
-    // Initialize and use the LCD
-    LcdHD44780 lcd;
-    lcd.Init(lcd_config);
-    // while (1)
-    // {
-        // lcd.SetCursor(0, 0);    // Row 0, Column 0
-    //     lcd.Print("Marty");  
-    // }
-    
+    uint32_t last_display_ms = 0U;
 
-    arm_hanning_f32(hann_window, FFT_SIZE); // generate Hann window
-    arm_status fft_init_status = arm_rfft_fast_init_f32(&fft_instance, FFT_SIZE);
-
-    if (fft_init_status != ARM_MATH_SUCCESS) // initialize FFT
+    while (true)
     {
-    // hw.PrintLine("FFT INIT ERROR: %d", (int)fft_init_status);
-        while (1)
+        step_buttons.debounceButtons();
+        const bool state_entry = (state != last_state);
+        last_state = state;
+
+        const uint32_t now_ms = daisy::System::GetNow();
+        if ((now_ms - last_display_ms) >= DISPLAY_UPDATE_INTERVAL_MS)
         {
-            errorLED();
-        }
-    }
-
-    hw.StartAudio(Callback);
-
-    uint32_t outputCounter = 0U;
-
-    std::vector<int> onsetTimes;
-    std::vector<float> intervalTimes;
-    onsetTimes.reserve(20);
-    intervalTimes.reserve(19);
-
-    while(true)
-    {
-
-        if (onsetTimes.size() == 20) onsetTimes.erase(onsetTimes.begin());
-        onsetTimes.push_back(frameCount);
-        
-        if (onsetTimes.size() > 2)
-        {
-            
-            float totalIntervalTime;
-            for (size_t i = 0; i < onsetTimes.size(); i++)
-            {
-                if (i == onsetTimes.size() - 1) continue;
-
-                int intervalFrame = onsetTimes[i+1] - onsetTimes[i];
-                float intervalMilliseconds = (intervalFrame * 1000) / FRAME_RATE;
-
-                totalIntervalTime += intervalMilliseconds;
-                intervalTimes.push_back(intervalMilliseconds);
-            }
-
-            std::sort(intervalTimes.begin(), intervalTimes.end());
-            float median;
-            
-            if (intervalTimes.size() % 2 == 1) {
-                median = intervalTimes[intervalTimes.size() / 2]; // clear middle element
-            } else {
-                median = (intervalTimes[intervalTimes.size() / 2] + intervalTimes[(intervalTimes.size() / 2) - 1]) / 2; //average of two middle elements
-            }
-
-            float estimatedBPM;
-
-            if (median == 0) {
-                estimatedBPM = 0.0f;
-            } else {
-                estimatedBPM = 60000 / median;
-            }
-
-            hw.PrintLine("BPM Value: %.2f", estimatedBPM);
-            lcd.SetCursor(0, 0);
-            lcd.PrintInt((int)estimatedBPM);
-
-            intervalTimes.clear();
+            printFlag = true;
+            last_display_ms = now_ms;
         }
 
-        while (samples_available >= FFT_SIZE)
+        switch (state)
         {
-            processFrame();
-
-            outputCounter++;
-
-            if (outputCounter % 4 == 0)
+            case CoJamState::IDLE:
             {
-                // outputSpectrum();
-                outputFlux();
+                step_leds.displayIdleMode();
+                if (state_entry) 
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("IDLE        ");
+                }
+                if (step_buttons.isListenButtonPressed())
+                {
+                    state = CoJamState::LISTENING;
+                    break;
+                } else if (step_buttons.isPlaybackButtonPressed())
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("No Track    ");
+                    daisy::System::Delay(1000);
+                }
+
+                break;
             }
 
-            outputOnset();
-
-            if (outputCounter >= 1000U)
+            case CoJamState::LISTENING:
             {
-                outputCounter = 0;
+                step_leds.displayListeningMode();
+                if (state_entry)
+                {
+                    UsbAudio_StartCapture();
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("LISTENING   ");
+                }
+
+                if (step_buttons.isPlaybackHeld())
+                {
+                    transmitted = false;
+                    UsbAudio_Reset();
+                    state = CoJamState::IDLE;
+                    break;
+                }
+
+                if (UsbAudio_HasReceiveError())
+                {
+                    transmitted = false;
+                    state = CoJamState::ERROR;
+                    break;
+                }
+
+                if (!UsbAudio_IsCaptureComplete())
+                {
+                    break;
+                }
+
+                if (!transmitted)
+                {
+                    hw.SetLed(true);
+                    // TODO: replace 0.0f with BpmDetector_GetSmoothedBPM()
+                    const float32_t daisy_bpm = 0.0f;
+                    UsbAudio_Transmit(daisy_bpm); // figure out which bpm to send - average bpm across recording?
+                    hw.SetLed(false);
+                    UsbAudio_StartReceive();
+                    transmitted = true;
+                }
+
+                if (!UsbAudio_IsReceiveComplete())
+                {
+                    break;
+                }
+
+                transmitted = false;
+
+                if (!UsbAudio_ValidatePlayback())
+                {
+                    state = CoJamState::ERROR;
+                    break;
+                }
+
+                state = CoJamState::READY;
+                break;
             }
 
+            case CoJamState::READY:
+            {
+                step_leds.displayReadyMode();
+                if (state_entry) 
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("READY       ");
+                }
+                if (step_buttons.isPlaybackHeld())
+                {
+                    UsbAudio_Reset();
+                    state = CoJamState::IDLE;
+                    break;
+                }
+
+                if (step_buttons.isListenButtonPressed())
+                {
+                    UsbAudio_Reset();
+                    state = CoJamState::IDLE;
+                    break;
+                }
+
+                if (step_buttons.isPlaybackButtonPressed())
+                {
+                    hw.SetLed(true);
+                    UsbAudio_ArmPlayback();
+                    state = CoJamState::PLAYING;
+                }
+                break;
+            }
+
+            case CoJamState::PLAYING:
+            {
+                step_leds.displayPlayingMode();
+                if (state_entry) 
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("PLAYING");
+                }
+                if (printFlag)
+                {
+                    // Display_Update();
+                    // printFlag = false;
+                }
+                hw.SetLed(true);
+                // TODO: BpmDetector_Process()
+                // TODO: Display_Update(static_cast<uint32_t>(
+                //           BpmDetector_GetSmoothedBPM() * 10.0f))
+
+                if (step_buttons.isPlaybackHeld())
+                {
+                    hw.SetLed(false);
+                    UsbAudio_Reset();
+                    state = CoJamState::IDLE;
+                    break;
+                }
+
+                if (step_buttons.isListenButtonPressed())
+                {
+                    hw.SetLed(false);
+                    UsbAudio_Reset();
+                    transmitted = false;
+                    state = CoJamState::LISTENING;
+                }
+
+                if (step_buttons.isPlaybackButtonPressed())
+                {
+                    hw.SetLed(false);
+                    UsbAudio_PausePlayback();
+                    state = CoJamState::PAUSED;
+                    break;
+                }
+
+                break;
+            }
+
+            case CoJamState::PAUSED:
+            {
+                if (state_entry)
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("PAUSED     ");
+                }
+
+                if (step_buttons.isPlaybackHeld())
+                {
+                    UsbAudio_Reset();
+                    state = CoJamState::IDLE;
+                    break;
+                }
+
+                if (step_buttons.isListenButtonPressed())
+                {
+                    UsbAudio_Reset();
+                    transmitted = false;
+                    state = CoJamState::LISTENING;
+                    break;
+                }
+
+                if (step_buttons.isPlaybackButtonPressed())
+                {
+                    UsbAudio_ArmPlayback();
+                    state = CoJamState::PLAYING;
+                    break;
+                }
+
+                break;
+            }
+
+            case CoJamState::ERROR:
+            default:
+            {
+                if (state_entry) {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("ERROR     ");
+                }
+                blinkError();
+                break;
+            }
         }
-        hw.SetLed(onsetDetected);
-        hw.DelayMs(1);
     }
 }
