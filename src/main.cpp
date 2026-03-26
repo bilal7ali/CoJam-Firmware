@@ -6,9 +6,12 @@
 #include <stdio.h>
 #include "step_leds.h"
 
-static daisy::DaisySeed hw;
-static StepButtons      step_buttons;
-static StepLEDs         step_leds;
+static daisy::DaisySeed     hw;
+static StepButtons          step_buttons;
+static StepLEDs             step_leds;
+static daisy::AnalogControl gain_knob;
+static daisy::AnalogControl density_knob;
+static daisy::LcdHD44780    lcd;
 
 // CONSTANTS
 static constexpr uint32_t AUDIO_BLOCK_SIZE           = 48U;
@@ -31,8 +34,8 @@ static CoJamState state = CoJamState::IDLE;
 static bool printFlag = false;
 static bool transmitted = false;
 static CoJamState last_state = CoJamState::IDLE;
-
-static daisy::LcdHD44780 lcd;
+static volatile float32_t drum_gain = 1.0f;
+static volatile uint8_t   density = 1U;
 
 static void Display_Init(void)
 {
@@ -79,8 +82,8 @@ static void AudioCallback(daisy::AudioHandle::InputBuffer  in,
 
         UsbAudio_CaptureSample(guitar);
         // TODO: BpmDetector_PushSample(guitar) once bpm_detector is merged
-
-        const float32_t drum = UsbAudio_GetPlaybackSample();
+        const float32_t current_gain = drum_gain;
+        const float32_t drum = current_gain * UsbAudio_GetPlaybackSample();
 
         out[0][i] = fmaxf(-1.0f, fminf(1.0f, guitar + drum));
     }
@@ -90,6 +93,15 @@ int main(void)
 {
     hw.Init();
     hw.SetAudioBlockSize(AUDIO_BLOCK_SIZE);
+
+    // ADC INITIALIZATION
+    daisy::AdcChannelConfig adc_cfg[2U];
+    adc_cfg[0U].InitSingle(daisy::seed::A0);
+    adc_cfg[1U].InitSingle(daisy::seed::A1);
+    hw.adc.Init(adc_cfg, 2U);
+    hw.adc.Start();
+    gain_knob.Init(hw.adc.GetPtr(0U), hw.AudioSampleRate());
+    density_knob.Init(hw.adc.GetPtr(1U), hw.AudioSampleRate());
 
     UsbAudio_Init(&hw);
     daisy::System::Delay(USB_STARTUP_DELAY_MS);
@@ -110,6 +122,12 @@ int main(void)
     while (true)
     {
         step_buttons.debounceButtons();
+        step_leds.Update();
+        drum_gain = gain_knob.Process();
+        const float32_t density_f = density_knob.Process() * 10.0f;
+        const float32_t density_clamped = fmaxf(1.0f, fminf(10.0f, density_f));
+        density = static_cast<uint8_t>(density_clamped);
+
         const bool state_entry = (state != last_state);
         last_state = state;
 
@@ -124,11 +142,12 @@ int main(void)
         {
             case CoJamState::IDLE:
             {
-                step_leds.displayIdleMode();
                 if (state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("IDLE        ");
+                    step_leds.setMode(StepLEDs::IDLE);
+                    // hw.Print("IDLE");
                 }
                 if (step_buttons.isListenButtonPressed())
                 {
@@ -138,6 +157,7 @@ int main(void)
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("No Track    ");
+                    // hw.Print("No Track"); // debugging
                     daisy::System::Delay(1000);
                 }
 
@@ -146,12 +166,12 @@ int main(void)
 
             case CoJamState::LISTENING:
             {
-                step_leds.displayListeningMode();
                 if (state_entry)
                 {
-                    UsbAudio_StartCapture();
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("LISTENING   ");
+                    step_leds.setMode(StepLEDs::LISTENING);
+                    UsbAudio_StartCapture();
                 }
 
                 if (step_buttons.isPlaybackHeld())
@@ -177,12 +197,11 @@ int main(void)
                 if (!transmitted)
                 {
                     hw.SetLed(true);
-                    // TODO: replace 0.0f with BpmDetector_GetSmoothedBPM()
-                    const float32_t daisy_bpm = 0.0f;
-                    UsbAudio_Transmit(daisy_bpm); // figure out which bpm to send - average bpm across recording?
-                    hw.SetLed(false);
+                    // TODO: replace 1U with value read from potentiometer ADC (range 1–10)
+                    UsbAudio_Transmit(density);
                     UsbAudio_StartReceive();
                     transmitted = true;
+                    hw.SetLed(false);
                 }
 
                 if (!UsbAudio_IsReceiveComplete())
@@ -204,11 +223,11 @@ int main(void)
 
             case CoJamState::READY:
             {
-                step_leds.displayReadyMode();
                 if (state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("READY       ");
+                    step_leds.setMode(StepLEDs::READY);
                 }
                 if (step_buttons.isPlaybackHeld())
                 {
@@ -235,11 +254,13 @@ int main(void)
 
             case CoJamState::PLAYING:
             {
-                step_leds.displayPlayingMode();
+                // ADD IN TRIPLE TAP ON BUTTON TO PLAY ADLIBS
+
                 if (state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("PLAYING");
+                    step_leds.setMode(StepLEDs::PLAYING);
                 }
                 if (printFlag)
                 {
@@ -284,6 +305,7 @@ int main(void)
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("PAUSED     ");
+                    step_leds.setMode(StepLEDs::PAUSED);
                 }
 
                 if (step_buttons.isPlaybackHeld())
@@ -317,6 +339,7 @@ int main(void)
                 if (state_entry) {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("ERROR     ");
+                    step_leds.setMode(StepLEDs::ERROR);
                 }
                 blinkError();
                 break;

@@ -3,56 +3,79 @@
 
 void StepLEDs::Init(const daisy::Pin &listen_pin, const daisy::Pin &playback_pin)
 {
-    listen_led.Init(listen_pin, daisy::GPIO::Mode::OUTPUT, daisy::GPIO::Pull::PULLUP);
+    listen_led.Init(listen_pin,   daisy::GPIO::Mode::OUTPUT, daisy::GPIO::Pull::PULLUP);
     playback_led.Init(playback_pin, daisy::GPIO::Mode::OUTPUT, daisy::GPIO::Pull::PULLUP);
 }
 
-void StepLEDs::clearLEDs()
+void StepLEDs::setMode(const uint8_t mode)
 {
-  listen_led.Write(false);  
-  playback_led.Write(false);  
+    if (mode != current_mode)
+    {
+        current_mode  = mode;
+        led_state     = false;
+        last_flash_ms = 0U;
+    }
 }
 
-void StepLEDs::displayIdleMode()
+void StepLEDs::Update(void)
 {
-    clearLEDs();
-    listen_led.Write(true);
-    playback_led.Write(false);  
-}
+    const uint32_t now = daisy::System::GetNow();
 
-void StepLEDs::displayListeningMode()
-{
-    clearLEDs();
-    listen_led.Write(true);
-    daisy::System::Delay(500);
-    listen_led.Write(false);
-    daisy::System::Delay(500);
-}
+    switch (current_mode)
+    {
+        case IDLE:
+            listen_led.Write(true);
+            playback_led.Write(false);
+            break;
 
-void StepLEDs::displayReadyMode()
-{
-    clearLEDs();
-    playback_led.Write(true);
-    daisy::System::Delay(500);
-    playback_led.Write(false);
-    daisy::System::Delay(500);
-}
+        case LISTENING:
+            if ((now - last_flash_ms) >= 500U)
+            {
+                led_state     = !led_state;
+                last_flash_ms = now;
+                listen_led.Write(led_state);
+                playback_led.Write(false);
+            }
+            break;
 
-void StepLEDs::displayPlayingMode()
-{
-    clearLEDs();
-    playback_led.Write(true);
-    listen_led.Write(false);
-}
+        case READY:
+            if ((now - last_flash_ms) >= 500U)
+            {
+                led_state     = !led_state;
+                last_flash_ms = now;
+                playback_led.Write(led_state);
+                listen_led.Write(false);
+            }
+            break;
 
+        case PLAYING:
+            listen_led.Write(false);
+            playback_led.Write(true);
+            break;
 
-void StepLEDs::doubleFlash()
-{
-    clearLEDs();
-    playback_led.Write(true);
-    listen_led.Write(true);
-    daisy::System::Delay(500);
-    playback_led.Write(false);
-    listen_led.Write(false);
-    daisy::System::Delay(500);
+        case PAUSED:
+            if ((now - last_flash_ms) >= 500U)
+            {
+                led_state     = !led_state;
+                last_flash_ms = now;
+                listen_led.Write(led_state);
+                playback_led.Write(led_state);
+            }
+            break;
+
+        case ERROR:
+            if ((now - last_flash_ms) >= 100U)
+            {
+                led_state     = !led_state;
+                last_flash_ms = now;
+                listen_led.Write(led_state);
+                playback_led.Write(led_state);
+            }
+            break;
+
+        default:
+            listen_led.Write(false);
+            playback_led.Write(false);
+            break;
+    }
 }

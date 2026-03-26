@@ -5,7 +5,7 @@ static daisy::DaisySeed* hw = nullptr;
 
 // ──────────────────────────────── CONSTANTS ────────────────────────────────
  
-static constexpr float32_t SAMPLE_RATE_HZ        = 48000.0f;
+static constexpr float32_t SAMPLE_RATE_HZ         = 48000.0f;
 static constexpr uint32_t  CAPTURE_SECONDS        = 2U;
 static constexpr uint32_t  CAPTURE_SAMPLES        =
     static_cast<uint32_t>(SAMPLE_RATE_HZ) * CAPTURE_SECONDS;  // 480,000
@@ -27,6 +27,8 @@ static constexpr uint32_t  USB_CHUNK_DELAY_US     = 100U;
 static constexpr uint8_t   READY_BYTE             = 0xAAU;
 static constexpr uint8_t   PREAMBLE_MAGIC[4U]     = { 0xC0U, 0x4AU, 0x41U, 0x4DU }; // COJAM
 static constexpr float32_t CAPTURE_GAIN           = 3.0f;
+static constexpr size_t    STYLE_HEADER_BYTES     = 2U;
+static constexpr size_t    MAX_STYLE_BYTES        = 256U;
 
 // WAV header byte offsets
 static constexpr size_t    WAV_OFFSET_RIFF        =  0U;
@@ -60,14 +62,17 @@ static volatile uint32_t playback_read_idx = 0U;
 // RECEIVE STATE
 enum class RxPhase : uint8_t
 {
-    PREAMBLE   = 0U,
-    WAV_HEADER = 1U,
-    PCM_DATA   = 2U,
-    COMPLETE   = 3U
+    PREAMBLE     = 0U,
+    STYLE_HEADER = 1U,
+    STYLE_DATA   = 2U,
+    WAV_HEADER   = 3U,
+    PCM_DATA     = 4U,
+    COMPLETE     = 5U
 };
 
 static volatile RxPhase   rx_phase           = RxPhase::PREAMBLE;
 static volatile uint32_t  rx_phase_bytes     = 0U;
+static volatile uint32_t  rx_style_len       = 0U;
 static volatile uint32_t  rx_pcm_bytes       = 0U;
 static volatile uint32_t  rx_data_size_bytes = 0U;
 static volatile float32_t received_bpm       = 0.0f;
@@ -77,6 +82,8 @@ static volatile bool      capture_armed      = false;
 
 static uint8_t rx_preamble_buf[PREAMBLE_BYTES];
 static uint8_t rx_header_buf[WAV_HEADER_BYTES];
+static uint8_t  rx_style_header_buf[STYLE_HEADER_BYTES];
+static uint8_t  rx_style_buf[MAX_STYLE_BYTES + 1U];
 
 // ──────────────────────────────── PRIVATE FUNCTIONS ────────────────────────────────
  
@@ -143,16 +150,16 @@ static void buildWavHeader(uint8_t* const header,
 }
 
 // PREAMBLE BUILDER
-static void buildPreamble(uint8_t* const buf, const float32_t bpm)
+static void buildPreamble(uint8_t* const buf, const uint8_t density)
 {
     buf[0] = PREAMBLE_MAGIC[0];
     buf[1] = PREAMBLE_MAGIC[1];
     buf[2] = PREAMBLE_MAGIC[2];
     buf[3] = PREAMBLE_MAGIC[3];
- 
-    uint32_t bpm_bits;
-    memcpy(&bpm_bits, &bpm, sizeof(uint32_t));
-    write_u32_le(&buf[4], bpm_bits);
+    buf[4] = density;  // range 1–10
+    buf[5] = 0U;       // pad
+    buf[6] = 0U;       // pad
+    buf[7] = 0U;       // pad
 }
 
 // USB TRANSMIT
@@ -234,40 +241,84 @@ static void RxCallback(uint8_t* buf, uint32_t* len)
 {
     const uint32_t bytes_in = *len;
     uint32_t       offset   = 0U;
- 
+
     while (offset < bytes_in)
     {
         const uint32_t remaining = bytes_in - offset;
- 
+
         switch (rx_phase)
         {
             case RxPhase::PREAMBLE:
             {
                 const uint32_t needed = static_cast<uint32_t>(PREAMBLE_BYTES) - rx_phase_bytes;
                 const uint32_t copy   = (remaining < needed) ? remaining : needed;
-                memcpy(&rx_preamble_buf[rx_phase_bytes],
-                       &buf[offset],
-                       static_cast<size_t>(copy));
+                memcpy(&rx_preamble_buf[rx_phase_bytes], &buf[offset], static_cast<size_t>(copy));
                 rx_phase_bytes += copy;
-                offset           += copy;
+                offset         += copy;
 
                 if (rx_phase_bytes >= static_cast<uint32_t>(PREAMBLE_BYTES))
                 {
-                    rx_phase       = RxPhase::WAV_HEADER;
+                    rx_phase       = RxPhase::STYLE_HEADER;
                     rx_phase_bytes = 0U;
                 }
                 break;
             }
- 
+
+            case RxPhase::STYLE_HEADER:
+            {
+                // Read 2 bytes to get the uint16_t style string length.
+                const uint32_t needed = static_cast<uint32_t>(STYLE_HEADER_BYTES) - rx_phase_bytes;
+                const uint32_t copy   = (remaining < needed) ? remaining : needed;
+                memcpy(&rx_style_header_buf[rx_phase_bytes], &buf[offset], static_cast<size_t>(copy));
+                rx_phase_bytes += copy;
+                offset         += copy;
+
+                if (rx_phase_bytes >= static_cast<uint32_t>(STYLE_HEADER_BYTES))
+                {
+                    rx_style_len   = static_cast<uint32_t>(read_u16_le(rx_style_header_buf));
+                    rx_phase       = RxPhase::STYLE_DATA;
+                    rx_phase_bytes = 0U;
+                }
+                break;
+            }
+
+            case RxPhase::STYLE_DATA:
+            {
+                // Consume rx_style_len bytes. Store up to MAX_STYLE_BYTES,
+                // silently discard any overflow — we don't act on it yet.
+                const uint32_t needed = rx_style_len - rx_phase_bytes;
+                const uint32_t copy   = (remaining < needed) ? remaining : needed;
+
+                if (rx_phase_bytes < static_cast<uint32_t>(MAX_STYLE_BYTES))
+                {
+                    const uint32_t space    = static_cast<uint32_t>(MAX_STYLE_BYTES) - rx_phase_bytes;
+                    const uint32_t to_store = (copy < space) ? copy : space;
+                    memcpy(&rx_style_buf[rx_phase_bytes], &buf[offset], static_cast<size_t>(to_store));
+                }
+
+                rx_phase_bytes += copy;
+                offset         += copy;
+
+                if (rx_phase_bytes >= rx_style_len)
+                {
+                    // Null-terminate whatever was stored.
+                    const uint32_t stored  = (rx_style_len < static_cast<uint32_t>(MAX_STYLE_BYTES))
+                                             ? rx_style_len
+                                             : static_cast<uint32_t>(MAX_STYLE_BYTES);
+                    rx_style_buf[stored]   = 0U;
+                    rx_phase               = RxPhase::WAV_HEADER;
+                    rx_phase_bytes         = 0U;
+                }
+                break;
+            }
+
             case RxPhase::WAV_HEADER:
             {
                 const uint32_t needed = static_cast<uint32_t>(WAV_HEADER_BYTES) - rx_phase_bytes;
                 const uint32_t copy   = (remaining < needed) ? remaining : needed;
-                memcpy(&rx_header_buf[rx_phase_bytes],
-                       &buf[offset],
-                       static_cast<size_t>(copy));
+                memcpy(&rx_header_buf[rx_phase_bytes], &buf[offset], static_cast<size_t>(copy));
                 rx_phase_bytes += copy;
-                offset           += copy;
+                offset         += copy;
 
                 if (rx_phase_bytes >= static_cast<uint32_t>(WAV_HEADER_BYTES))
                 {
@@ -277,33 +328,27 @@ static void RxCallback(uint8_t* buf, uint32_t* len)
                 }
                 break;
             }
- 
+
             case RxPhase::PCM_DATA:
             {
                 const uint32_t needed = rx_data_size_bytes - rx_pcm_bytes;
                 const uint32_t copy   = (remaining < needed) ? remaining : needed;
- 
-                // Write directly into the SDRAM playback buffer as bytes.
-                // Cache coherency is handled in UsbAudio_ValidateAndArmPlayback
-                // via SCB_CleanInvalidateDCache() before playback is armed.
                 memcpy(reinterpret_cast<uint8_t*>(playback_buf) + rx_pcm_bytes,
                        &buf[offset],
                        static_cast<size_t>(copy));
-
                 rx_pcm_bytes += copy;
                 offset       += copy;
 
                 if (rx_pcm_bytes >= rx_data_size_bytes)
                 {
                     rx_phase         = RxPhase::COMPLETE;
-                    receive_complete = true;  // gate for main-loop polling
+                    receive_complete = true;
                 }
                 break;
             }
- 
+
             case RxPhase::COMPLETE:
             default:
-                // Drain any trailing bytes rather than letting them accumulate.
                 offset = bytes_in;
                 break;
         }
@@ -363,13 +408,11 @@ bool UsbAudio_IsCaptureComplete(void)
     return capture_complete;
 }
  
-void UsbAudio_Transmit(const float32_t daisy_bpm)
+void UsbAudio_Transmit(const uint8_t density)
 {
-    // Clean D-cache before USB DMA reads from the SDRAM capture buffer,
-    // ensuring any dirty cache lines are written back to physical memory.
     SCB_CleanDCache();
  
-    buildPreamble(preamble_buf, daisy_bpm);
+    buildPreamble(preamble_buf, density);
     transmitAll(preamble_buf, static_cast<uint32_t>(PREAMBLE_BYTES));
 
     buildWavHeader(wav_header_buf,
@@ -475,6 +518,7 @@ void UsbAudio_Reset(void)
 
     rx_phase           = RxPhase::PREAMBLE;
     rx_phase_bytes     = 0U;
+    rx_style_len       = 0U;
     rx_pcm_bytes       = 0U;
     rx_data_size_bytes = 0U;
     received_bpm       = 0.0f;
@@ -482,7 +526,9 @@ void UsbAudio_Reset(void)
     receive_error      = false;
 
     memset(rx_preamble_buf, 0U, PREAMBLE_BYTES);
-    memset(rx_header_buf,   0U, WAV_HEADER_BYTES);
+    memset(rx_header_buf, 0U, WAV_HEADER_BYTES);
+    memset(rx_style_buf, 0U, MAX_STYLE_BYTES + 1U);
+    memset(rx_style_header_buf, 0U, STYLE_HEADER_BYTES);
 }
 
 void UsbAudio_StartCapture(void) // called on listen button press

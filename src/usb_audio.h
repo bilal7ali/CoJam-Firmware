@@ -20,7 +20,7 @@ bool UsbAudio_IsPlaybackActive(void);
 bool UsbAudio_IsCaptureComplete(void);
  
 // Blocks until all bytes are sent
-void UsbAudio_Transmit(float32_t daisy_bpm);
+void UsbAudio_Transmit(uint8_t density);
  
 // Send 0xAA ready byte and register receive ISR
 // Call once after UsbAudio_Transmit()
