@@ -5,6 +5,7 @@
 #include "usb_audio.h"
 #include <stdio.h>
 #include "step_leds.h"
+#include "knob_display.h"
 
 static daisy::DaisySeed     hw;
 static StepButtons          step_buttons;
@@ -12,12 +13,15 @@ static StepLEDs             step_leds;
 static daisy::AnalogControl gain_knob;
 static daisy::AnalogControl density_knob;
 static daisy::LcdHD44780    lcd;
+static KnobDisplay          knob_display;
 
 // CONSTANTS
 static constexpr uint32_t AUDIO_BLOCK_SIZE           = 48U;
 static constexpr uint32_t USB_STARTUP_DELAY_MS       = 3000U;
 static constexpr uint32_t LED_BLINK_INTERVAL_MS      = 50U;
 static constexpr uint32_t DISPLAY_UPDATE_INTERVAL_MS = 250U;
+static constexpr float32_t ADC_OBSERVED_MIN = 0.03f;
+static constexpr float32_t ADC_OBSERVED_MAX = 0.97f;
 
 // STATES
 enum class CoJamState : uint8_t
@@ -36,6 +40,13 @@ static bool transmitted = false;
 static CoJamState last_state = CoJamState::IDLE;
 static volatile float32_t drum_gain = 1.0f;
 static volatile uint8_t   density = 1U;
+
+static float32_t rescaleAdc(const float32_t raw)
+{
+    const float32_t scaled = (raw - ADC_OBSERVED_MIN)
+                             / (ADC_OBSERVED_MAX - ADC_OBSERVED_MIN);
+    return fmaxf(0.0f, fminf(1.0f, scaled));
+}
 
 static void Display_Init(void)
 {
@@ -101,7 +112,7 @@ int main(void)
     hw.adc.Init(adc_cfg, 2U);
     hw.adc.Start();
     gain_knob.Init(hw.adc.GetPtr(0U), hw.AudioSampleRate(), true);
-    density_knob.Init(hw.adc.GetPtr(1U), hw.AudioSampleRate());
+    density_knob.Init(hw.adc.GetPtr(1U), hw.AudioSampleRate(), true);
 
     UsbAudio_Init(&hw);
     daisy::System::Delay(USB_STARTUP_DELAY_MS);
@@ -114,6 +125,7 @@ int main(void)
 
     // TODO: BpmDetector_Init() once bpm_detector is merged
     Display_Init();
+    knob_display.Init(&lcd);
 
     hw.StartAudio(AudioCallback);
 
@@ -123,26 +135,39 @@ int main(void)
     {
         step_buttons.debounceButtons();
         step_leds.Update();
-        drum_gain = gain_knob.Process();
-        const float32_t density_f = density_knob.Process() * 10.0f;
-        const float32_t density_clamped = fmaxf(1.0f, fminf(10.0f, density_f));
-        density = static_cast<uint8_t>(density_clamped);
+        
+        const uint32_t now_ms = daisy::System::GetNow();
+
+        const float32_t gain_raw    = gain_knob.Process();
+        const float32_t density_raw = density_knob.Process();
+        const float32_t gain_scaled    = rescaleAdc(gain_raw);
+        const float32_t density_scaled = rescaleAdc(density_raw);
+        drum_gain = gain_scaled;
+
+        const uint8_t density_val = static_cast<uint8_t>(
+            fmaxf(1.0f, fminf(10.0f, density_scaled * 9.0f + 1.0f)));
+        density = density_val;
 
         const bool state_entry = (state != last_state);
         last_state = state;
 
-        const uint32_t now_ms = daisy::System::GetNow();
+        knob_display.Update(now_ms, gain_scaled, density_scaled, drum_gain, density);
+        knob_display.Render(printFlag);
+
         if ((now_ms - last_display_ms) >= DISPLAY_UPDATE_INTERVAL_MS)
         {
-            printFlag = true;
+            printFlag       = true;
             last_display_ms = now_ms;
         }
+
+        const bool lcd_state_entry = (state_entry || knob_display.ConsumeRedrawFlag())
+                              && !knob_display.IsActive();
 
         switch (state)
         {
             case CoJamState::IDLE:
             {
-                if (state_entry) 
+                if (lcd_state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("IDLE        ");
@@ -156,7 +181,7 @@ int main(void)
                 } else if (step_buttons.isPlaybackButtonPressed())
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("No Track    ");
+                    lcd.Print("No Track        ");
                     // hw.Print("No Track"); // debugging
                     // daisy::System::Delay(1000);
                 }
@@ -168,10 +193,14 @@ int main(void)
             {
                 if (state_entry)
                 {
-                    lcd.SetCursor(0U, 0U);
-                    lcd.Print("LISTENING   ");
-                    step_leds.setMode(StepLEDs::LISTENING);
                     UsbAudio_StartCapture();
+                    step_leds.setMode(StepLEDs::LISTENING);
+                }
+
+                if (lcd_state_entry)
+                {
+                    lcd.SetCursor(0U, 0U);
+                    lcd.Print("LISTENING        ");
                 }
 
                 if (step_buttons.isPlaybackHeld())
@@ -222,10 +251,10 @@ int main(void)
 
             case CoJamState::READY:
             {
-                if (state_entry) 
+                if (lcd_state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("READY       ");
+                    lcd.Print("READY        ");
                     step_leds.setMode(StepLEDs::READY);
                 }
                 if (step_buttons.isPlaybackHeld())
@@ -255,10 +284,10 @@ int main(void)
             {
                 // ADD IN TRIPLE TAP ON BUTTON TO PLAY ADLIBS
 
-                if (state_entry) 
+                if (lcd_state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("PLAYING");
+                    lcd.Print("PLAYING        ");
                     step_leds.setMode(StepLEDs::PLAYING);
                 }
                 if (printFlag)
@@ -285,6 +314,7 @@ int main(void)
                     UsbAudio_Reset();
                     transmitted = false;
                     state = CoJamState::LISTENING;
+                    break;
                 }
 
                 if (step_buttons.isPlaybackButtonPressed())
@@ -300,10 +330,10 @@ int main(void)
 
             case CoJamState::PAUSED:
             {
-                if (state_entry)
+                if (lcd_state_entry)
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("PAUSED     ");
+                    lcd.Print("PAUSED        ");
                     step_leds.setMode(StepLEDs::PAUSED);
                 }
 
@@ -335,9 +365,9 @@ int main(void)
             case CoJamState::ERROR:
             default:
             {
-                if (state_entry) {
+                if (lcd_state_entry) {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("ERROR     ");
+                    lcd.Print("ERROR        ");
                     step_leds.setMode(StepLEDs::ERROR);
                 }
                 blinkError();

@@ -6,7 +6,8 @@ CPP_SOURCES = \
 src/main.cpp \
 src/usb_audio.cpp \
 src/step_buttons.cpp \
-src/step_leds.cpp
+src/step_leds.cpp \
+src/knob_display.cpp
 
 # Library Locations
 LIBDAISY_DIR = libDaisy

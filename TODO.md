@@ -13,5 +13,5 @@
 <!-- - flip potentiometer -->
 - display BPM
 - 3 second countdown when pressing LISTEN button
-- display density and / or drum gain on screen ONLY when modifying
+<!-- - display density and / or drum gain on screen ONLY when modifying -->
 - add a cancel and return to IDLE option in LISTENING state
