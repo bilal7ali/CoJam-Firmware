@@ -6,7 +6,7 @@ static daisy::DaisySeed* hw = nullptr;
 // ──────────────────────────────── CONSTANTS ────────────────────────────────
  
 static constexpr float32_t SAMPLE_RATE_HZ         = 48000.0f;
-static constexpr uint32_t  CAPTURE_SECONDS        = 2U;
+static constexpr uint32_t  CAPTURE_SECONDS        = 20U;
 static constexpr uint32_t  CAPTURE_SAMPLES        =
     static_cast<uint32_t>(SAMPLE_RATE_HZ) * CAPTURE_SECONDS;  // 480,000
  

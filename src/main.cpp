@@ -100,7 +100,7 @@ int main(void)
     adc_cfg[1U].InitSingle(daisy::seed::A1);
     hw.adc.Init(adc_cfg, 2U);
     hw.adc.Start();
-    gain_knob.Init(hw.adc.GetPtr(0U), hw.AudioSampleRate());
+    gain_knob.Init(hw.adc.GetPtr(0U), hw.AudioSampleRate(), true);
     density_knob.Init(hw.adc.GetPtr(1U), hw.AudioSampleRate());
 
     UsbAudio_Init(&hw);
@@ -158,7 +158,7 @@ int main(void)
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("No Track    ");
                     // hw.Print("No Track"); // debugging
-                    daisy::System::Delay(1000);
+                    // daisy::System::Delay(1000);
                 }
 
                 break;
@@ -197,7 +197,6 @@ int main(void)
                 if (!transmitted)
                 {
                     hw.SetLed(true);
-                    // TODO: replace 1U with value read from potentiometer ADC (range 1–10)
                     UsbAudio_Transmit(density);
                     UsbAudio_StartReceive();
                     transmitted = true;

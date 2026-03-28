@@ -8,3 +8,10 @@
 - Set up volume control (just read pot and multiply by gain)
 - Set up density control (just read pot and send with with .wav)
 - Fix on-board BPM calculation and print BPM to screen constantly
+
+
+<!-- - flip potentiometer -->
+- display BPM
+- 3 second countdown when pressing LISTEN button
+- display density and / or drum gain on screen ONLY when modifying
+- add a cancel and return to IDLE option in LISTENING state
