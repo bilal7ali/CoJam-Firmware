@@ -70,6 +70,8 @@ void KnobDisplay::Render(bool& print_flag)
     buf[16U] = '\0';
     lcd_->SetCursor(0U, 0U);
     lcd_->Print(buf);
+    lcd_->SetCursor(1U, 0U);
+    lcd_->Print("                ");
     print_flag = false;
 }
 

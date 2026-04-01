@@ -62,25 +62,24 @@ static void Display_Init(void)
     lcd.Init(cfg);
 }
 
-// bpm_x10: smoothedBPM * 10, integer/fractional split avoids float formatting.
-static void Display_Update(const uint32_t bpm_x10)
+static void Display_StateWithBPM(const char* const label, const float32_t bpm)
 {
+    const uint32_t bpm_int = static_cast<uint32_t>(bpm + 0.5f);  // rounded
     char buf[17U];
-    const uint32_t whole = bpm_x10 / 10U;
-    const uint32_t frac  = bpm_x10 % 10U;
-    sprintf(buf, "BPM:  %3lu.%lu      ", whole, frac);
+    sprintf(buf, "%-7s BPM: %3lu", label, bpm_int);
     buf[16U] = '\0';
     lcd.SetCursor(0U, 0U);
     lcd.Print(buf);
 }
 
-static void blinkError(void)
+static void Display_StyleRow(void)
 {
-    while (true)
-    {
-        hw.SetLed(true);  daisy::System::Delay(LED_BLINK_INTERVAL_MS);
-        hw.SetLed(false); daisy::System::Delay(LED_BLINK_INTERVAL_MS);
-    }
+    char buf[17U];
+    const char* const style = UsbAudio_GetReceivedStyle();
+    snprintf(buf, sizeof(buf), "%-16s", style);
+    buf[16U] = '\0';
+    lcd.SetCursor(1U, 0U);
+    lcd.Print(buf);
 }
 
 static void AudioCallback(daisy::AudioHandle::InputBuffer  in,
@@ -170,7 +169,9 @@ int main(void)
                 if (lcd_state_entry) 
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("IDLE        ");
+                    lcd.Print("IDLE            ");
+                    lcd.SetCursor(1U, 0U);
+                    lcd.Print("                ");
                     step_leds.setMode(StepLEDs::IDLE);
                     // hw.Print("IDLE");
                 }
@@ -201,6 +202,8 @@ int main(void)
                 {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("LISTENING        ");
+                    lcd.SetCursor(1U, 0U);
+                    lcd.Print("                ");
                 }
 
                 if (step_buttons.isPlaybackHeld())
@@ -253,8 +256,8 @@ int main(void)
             {
                 if (lcd_state_entry) 
                 {
-                    lcd.SetCursor(0U, 0U);
-                    lcd.Print("READY        ");
+                    Display_StateWithBPM("READY", UsbAudio_GetReceivedBPM());
+                    Display_StyleRow();
                     step_leds.setMode(StepLEDs::READY);
                 }
                 if (step_buttons.isPlaybackHeld())
@@ -286,19 +289,17 @@ int main(void)
 
                 if (lcd_state_entry) 
                 {
-                    lcd.SetCursor(0U, 0U);
-                    lcd.Print("PLAYING        ");
+                    Display_StateWithBPM("PLAYING", UsbAudio_GetReceivedBPM());
+                    Display_StyleRow();
                     step_leds.setMode(StepLEDs::PLAYING);
                 }
-                if (printFlag)
+                if (printFlag && !knob_display.IsActive())
                 {
-                    // Display_Update();
-                    // printFlag = false;
+                    Display_StateWithBPM("PLAYING", UsbAudio_GetReceivedBPM());
+                    Display_StyleRow();
+                    printFlag = false;
                 }
                 hw.SetLed(true);
-                // TODO: BpmDetector_Process()
-                // TODO: Display_Update(static_cast<uint32_t>(
-                //           BpmDetector_GetSmoothedBPM() * 10.0f))
 
                 if (step_buttons.isPlaybackHeld())
                 {
@@ -333,7 +334,9 @@ int main(void)
                 if (lcd_state_entry)
                 {
                     lcd.SetCursor(0U, 0U);
-                    lcd.Print("PAUSED        ");
+                    lcd.Print("PAUSED          ");
+                    lcd.SetCursor(1U, 0U);
+                    lcd.Print("                ");
                     step_leds.setMode(StepLEDs::PAUSED);
                 }
 
@@ -368,9 +371,10 @@ int main(void)
                 if (lcd_state_entry) {
                     lcd.SetCursor(0U, 0U);
                     lcd.Print("ERROR        ");
+                    lcd.SetCursor(1U, 0U);
+                    lcd.Print("                ");
                     step_leds.setMode(StepLEDs::ERROR);
                 }
-                blinkError();
                 break;
             }
         }

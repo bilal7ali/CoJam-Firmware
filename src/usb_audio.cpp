@@ -542,3 +542,8 @@ void UsbAudio_PausePlayback(void)
 {
     playback_active = false;
 }
+
+const char* UsbAudio_GetReceivedStyle(void)
+{
+    return reinterpret_cast<const char*>(rx_style_buf);
+}

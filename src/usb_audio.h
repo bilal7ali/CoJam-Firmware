@@ -41,3 +41,5 @@ void UsbAudio_Reset(void);
 void UsbAudio_StartCapture(void);
 
 void UsbAudio_PausePlayback(void);
+
+const char* UsbAudio_GetReceivedStyle(void);
